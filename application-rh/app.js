@@ -22,6 +22,9 @@ const state = {
   calendarMonth: new Date().getMonth(),
   calendarYear: new Date().getFullYear(),
   apiReady: false,
+  authRequired: false,
+  authenticated: false,
+  durableDatabase: false,
   databasePath: "",
   data: loadState(),
 };
@@ -62,7 +65,7 @@ function saveState() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(async () => {
     try {
-      const response = await fetch("/api/state", {
+      const response = await apiFetch("/api/state", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ data: state.data }),
@@ -73,6 +76,22 @@ function saveState() {
       showToast("Attention : la sauvegarde dans la base a échoué.");
     }
   }, 180);
+}
+
+async function apiFetch(url, options = {}) {
+  const response = await fetch(url, {
+    credentials: "same-origin",
+    ...options,
+    headers: {
+      ...(options.headers || {}),
+    },
+  });
+  if (response.status === 401) {
+    state.apiReady = false;
+    state.authenticated = false;
+    renderLogin();
+  }
+  return response;
 }
 
 async function initApp() {
@@ -92,12 +111,24 @@ async function initApp() {
     </section>
   `;
   try {
-    const response = await fetch("/api/bootstrap");
+    const authResponse = await fetch("/api/auth/status", { credentials: "same-origin" });
+    if (authResponse.ok) {
+      const auth = await authResponse.json();
+      state.authRequired = Boolean(auth.authRequired);
+      state.authenticated = Boolean(auth.authenticated);
+      if (state.authRequired && !state.authenticated) {
+        renderLogin();
+        return;
+      }
+    }
+    const response = await apiFetch("/api/bootstrap");
     if (!response.ok) throw new Error("API indisponible");
     const payload = await response.json();
     state.databasePath = payload.database || "";
+    state.durableDatabase = Boolean(payload.durable);
     state.data = payload.data || defaultState();
     state.apiReady = true;
+    state.authenticated = true;
     render();
     if (!payload.data) showToast("Base SQLite vide : ajoute le premier collaborateur pour démarrer.");
   } catch (error) {
@@ -106,6 +137,51 @@ async function initApp() {
     render();
     showToast("Serveur non disponible : mode navigateur local activé.");
   }
+}
+
+function renderLogin() {
+  document.getElementById("pageTitle").textContent = "Connexion RH";
+  document.getElementById("appContent").innerHTML = `
+    <section class="panel">
+      <div class="panel-header">
+        <div>
+          <h3>Connexion sécurisée</h3>
+          <p>Entre le mot de passe administrateur pour accéder aux données RH.</p>
+        </div>
+      </div>
+      <form id="loginForm" class="form-grid">
+        <label class="full">
+          <span>Mot de passe</span>
+          <input id="loginPassword" type="password" autocomplete="current-password" required autofocus>
+        </label>
+        <div class="toolbar full">
+          <button class="primary" type="submit">Se connecter</button>
+        </div>
+      </form>
+    </section>
+    <section class="panel">
+      <div class="panel-header">
+        <div>
+          <h3>Maintenance base de données</h3>
+          <p>Export, import et sauvegarde manuelle des données RH.</p>
+        </div>
+      </div>
+      <div class="${state.durableDatabase ? "success" : "warning"}">
+        ${state.durableDatabase
+          ? `Base durable active : ${state.databasePath || "emplacement serveur"}`
+          : `Base non durable : ${state.databasePath || "emplacement temporaire"}. Active un disque Render pour conserver les données après redémarrage.`}
+      </div>
+      <div class="toolbar">
+        <button class="secondary" data-action="export-data">Exporter les données JSON</button>
+        <button class="ghost" data-action="backup-db">Créer une sauvegarde serveur</button>
+        <label class="ghost">
+          Importer JSON
+          <input id="importDataFile" type="file" accept="application/json,.json" hidden>
+        </label>
+        ${state.authRequired ? `<button class="danger" data-action="logout">Déconnexion</button>` : ""}
+      </div>
+    </section>
+  `;
 }
 
 function today() {
@@ -389,9 +465,9 @@ function renderDashboard() {
   const alerts = generateAlerts().slice(0, 6);
   const recent = state.data.auditLog.slice(0, 5);
   return `
-    <div class="${API_MODE && state.apiReady ? "success" : "warning"}">
+    <div class="${API_MODE && state.apiReady && state.durableDatabase ? "success" : "warning"}">
       ${API_MODE && state.apiReady
-        ? `✅ Base de données SQLite active : ${state.databasePath}`
+        ? `${state.durableDatabase ? "✅ Base durable active" : "⚠ Base active mais non durable"} : ${state.databasePath}`
         : "⚠ Mode navigateur simple : lance LANCER_APPLICATION_RH.bat pour utiliser la vraie base de données."}
     </div>
 
@@ -1278,6 +1354,102 @@ function parseNumberList(value) {
   return value.split(",").map((x) => Number(x.trim())).filter((x) => Number.isFinite(x)).sort((a, b) => b - a);
 }
 
+async function login(event) {
+  event.preventDefault();
+  const password = document.getElementById("loginPassword").value;
+  const response = await fetch("/api/auth/login", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ password }),
+  });
+  if (!response.ok) {
+    showToast("Mot de passe incorrect.");
+    return;
+  }
+  state.authenticated = true;
+  showToast("Connexion réussie.");
+  await initApp();
+}
+
+async function logout() {
+  await fetch("/api/auth/logout", { method: "POST", credentials: "same-origin" });
+  state.authenticated = false;
+  state.apiReady = false;
+  renderLogin();
+}
+
+async function exportData() {
+  if (!API_MODE) {
+    const blob = new Blob([JSON.stringify(state.data, null, 2)], { type: "application/json" });
+    downloadBlob(blob, `rh_control_export_${Date.now()}.json`);
+    return;
+  }
+  const response = await apiFetch("/api/export");
+  if (!response.ok) {
+    showToast("Export impossible.");
+    return;
+  }
+  const blob = await response.blob();
+  downloadBlob(blob, `rh_control_export_${Date.now()}.json`);
+}
+
+async function backupDatabase() {
+  if (!API_MODE) {
+    showToast("Backup serveur disponible uniquement via le serveur.");
+    return;
+  }
+  const response = await apiFetch("/api/backup", { method: "POST" });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || !payload.ok) {
+    showToast("Sauvegarde serveur impossible.");
+    return;
+  }
+  showToast(payload.durable ? "Sauvegarde créée sur le disque serveur." : "Sauvegarde créée, mais le stockage Render reste temporaire.");
+}
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+async function importDataFile(file) {
+  if (!file) return;
+  const text = await file.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    showToast("Fichier JSON invalide.");
+    return;
+  }
+  if (!confirm("Importer ce fichier va remplacer les données actuellement enregistrées. Continuer ?")) return;
+  if (!API_MODE) {
+    state.data = data;
+    saveState();
+    render();
+    showToast("Données importées dans le navigateur.");
+    return;
+  }
+  const response = await apiFetch("/api/import", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ data }),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || !payload.ok) {
+    showToast("Import impossible.");
+    return;
+  }
+  state.data = payload.data || data;
+  render();
+  showToast("Données importées dans la base.");
+}
+
 function downloadTicket(id) {
   const doc = state.data.documents.find((item) => item.id === id);
   const blob = new Blob([doc.content], { type: "text/plain;charset=utf-8" });
@@ -1327,6 +1499,9 @@ document.addEventListener("click", (event) => {
   if (action === "leave-approve") transitionLeave(id, "approve");
   if (action === "view-ticket") viewTicket(id);
   if (action === "download-ticket") downloadTicket(id);
+  if (action === "export-data") exportData();
+  if (action === "backup-db") backupDatabase();
+  if (action === "logout") logout();
   if (action === "calendar-prev") {
     state.calendarMonth -= 1;
     if (state.calendarMonth < 0) {
@@ -1346,6 +1521,7 @@ document.addEventListener("click", (event) => {
 });
 
 document.addEventListener("submit", (event) => {
+  if (event.target.id === "loginForm") login(event);
   if (event.target.id === "leaveForm") createLeave(event);
   if (event.target.id === "settingsForm") saveSettings(event);
 });
@@ -1368,6 +1544,10 @@ document.addEventListener("change", (event) => {
   if (event.target.id === "calendarServiceFilter") {
     state.calendarFilter.service = event.target.value;
     render();
+  }
+  if (event.target.id === "importDataFile") {
+    importDataFile(event.target.files?.[0]);
+    event.target.value = "";
   }
 });
 

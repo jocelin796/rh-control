@@ -56,6 +56,40 @@ Ajouter ensuite un disque persistant :
 
 Important : sans disque persistant, la base SQLite peut être perdue après redémarrage ou redéploiement.
 
+## Sécurité légère
+
+Le serveur peut protéger l’application par mot de passe avec ces variables Render :
+
+- `APP_PASSWORD` : mot de passe d’accès à l’application ;
+- `APP_SESSION_SECRET` : secret utilisé pour signer la session.
+
+Si `APP_PASSWORD` n’est pas défini, l’application reste ouverte.
+
+## Sauvegardes
+
+Dans l’onglet `Paramétrage`, une section `Maintenance base de données` permet :
+
+- d’exporter les données RH en JSON ;
+- d’importer un export JSON ;
+- de créer une sauvegarde serveur de la base SQLite.
+
+Sur Render gratuit, ces sauvegardes serveur restent temporaires. Pour qu’elles soient durables, il faut un disque persistant.
+
+## État actuel Render gratuit
+
+Le plan gratuit Render ne permet pas de disque persistant pour SQLite. La base peut donc être perdue après redémarrage ou redéploiement.
+
+Pour rendre SQLite durable sur Render :
+
+1. Ajouter un moyen de paiement au compte Render.
+2. Passer le service web à un plan payant.
+3. Ajouter un disque persistant :
+   - Mount Path : `/var/data`
+   - Size : `1 GB`
+4. Définir :
+   - `RH_DATABASE_PATH=/var/data/rh_control.sqlite`
+5. Redéployer le service.
+
 ## Ouverture sans serveur
 
 Il est toujours possible d’ouvrir `index.html` directement, mais dans ce mode l’application utilise le stockage du navigateur. Pour un vrai enregistrement dans une base de données, utiliser le fichier `LANCER_APPLICATION_RH.bat`.

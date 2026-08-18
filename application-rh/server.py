@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import os
+import shutil
 import sqlite3
 import sys
+import time
 import webbrowser
+from datetime import datetime
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -17,6 +23,10 @@ DB_PATH = Path(os.environ.get("RH_DATABASE_PATH") or (RENDER_DB_PATH if os.envir
 DB_DIR = DB_PATH.parent
 HOST = os.environ.get("HOST") or ("0.0.0.0" if os.environ.get("PORT") else "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8750"))
+APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
+APP_SESSION_SECRET = os.environ.get("APP_SESSION_SECRET") or APP_PASSWORD or "local-dev-session-secret"
+SESSION_COOKIE = "rh_session"
+SESSION_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 
 
 def connect() -> sqlite3.Connection:
@@ -35,6 +45,61 @@ def init_db() -> None:
             "INSERT OR REPLACE INTO app_meta(key, value) VALUES (?, ?)",
             ("schema_version", "1"),
         )
+
+
+def db_is_durable() -> bool:
+    path = str(DB_PATH).replace("\\", "/")
+    if os.environ.get("RENDER"):
+        return path.startswith("/var/data/")
+    return True
+
+
+def auth_required() -> bool:
+    return bool(APP_PASSWORD)
+
+
+def sign_session(payload: str) -> str:
+    return hmac.new(APP_SESSION_SECRET.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def create_session_cookie() -> str:
+    issued_at = str(int(time.time()))
+    signature = sign_session(issued_at)
+    token = base64.urlsafe_b64encode(f"{issued_at}:{signature}".encode("utf-8")).decode("ascii")
+    flags = "HttpOnly; Path=/; SameSite=Lax; Max-Age=" + str(SESSION_MAX_AGE_SECONDS)
+    if os.environ.get("RENDER"):
+        flags += "; Secure"
+    return f"{SESSION_COOKIE}={token}; {flags}"
+
+
+def parse_cookie(header: str | None) -> dict[str, str]:
+    if not header:
+        return {}
+    cookies: dict[str, str] = {}
+    for part in header.split(";"):
+        if "=" not in part:
+            continue
+        key, value = part.strip().split("=", 1)
+        cookies[key] = value
+    return cookies
+
+
+def verify_session_cookie(header: str | None) -> bool:
+    if not auth_required():
+        return True
+    token = parse_cookie(header).get(SESSION_COOKIE)
+    if not token:
+        return False
+    try:
+        decoded = base64.urlsafe_b64decode(token.encode("ascii")).decode("utf-8")
+        issued_at, signature = decoded.split(":", 1)
+        if not hmac.compare_digest(signature, sign_session(issued_at)):
+            return False
+        if time.time() - int(issued_at) > SESSION_MAX_AGE_SECONDS:
+            return False
+        return True
+    except Exception:
+        return False
 
 
 def rows(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
@@ -351,11 +416,13 @@ class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(ROOT), **kwargs)
 
-    def send_json(self, payload: dict, status: int = 200) -> None:
+    def send_json(self, payload: dict, status: int = 200, extra_headers: dict[str, str] | None = None) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        for key, value in (extra_headers or {}).items():
+            self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body)
 
@@ -364,23 +431,114 @@ class Handler(SimpleHTTPRequestHandler):
         raw = self.rfile.read(length).decode("utf-8")
         return json.loads(raw or "{}")
 
+    def is_authenticated(self) -> bool:
+        return verify_session_cookie(self.headers.get("Cookie"))
+
+    def require_auth(self) -> bool:
+        if self.is_authenticated():
+            return True
+        self.send_json({"ok": False, "error": "Authentification requise"}, status=401)
+        return False
+
+    def send_json_download(self, filename: str, payload: dict) -> None:
+        body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/api/health":
-            self.send_json({"ok": True, "database": str(DB_PATH), "mode": "sqlite"})
+            self.send_json({
+                "ok": True,
+                "database": str(DB_PATH),
+                "mode": "sqlite",
+                "durable": db_is_durable(),
+                "authRequired": auth_required(),
+            })
+            return
+        if path == "/api/auth/status":
+            self.send_json({
+                "ok": True,
+                "authRequired": auth_required(),
+                "authenticated": self.is_authenticated(),
+            })
             return
         if path == "/api/bootstrap":
-            self.send_json({"ok": True, "database": str(DB_PATH), "data": get_state()})
+            if not self.require_auth():
+                return
+            self.send_json({
+                "ok": True,
+                "database": str(DB_PATH),
+                "durable": db_is_durable(),
+                "data": get_state(),
+            })
+            return
+        if path == "/api/export":
+            if not self.require_auth():
+                return
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.send_json_download(f"rh_control_export_{stamp}.json", get_state())
             return
         return super().do_GET()
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if path == "/api/auth/login":
+            payload = self.read_json()
+            password = payload.get("password", "")
+            if not auth_required() or hmac.compare_digest(password, APP_PASSWORD):
+                self.send_json(
+                    {"ok": True, "authRequired": auth_required()},
+                    extra_headers={"Set-Cookie": create_session_cookie()},
+                )
+                return
+            self.send_json({"ok": False, "error": "Mot de passe incorrect"}, status=401)
+            return
+        if path == "/api/auth/logout":
+            self.send_json(
+                {"ok": True},
+                extra_headers={"Set-Cookie": f"{SESSION_COOKIE}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0"},
+            )
+            return
+        if path == "/api/backup":
+            if not self.require_auth():
+                return
+            try:
+                backup_dir = DB_DIR / "backups"
+                backup_dir.mkdir(parents=True, exist_ok=True)
+                backup_path = backup_dir / f"rh_control_backup_{datetime.now():%Y%m%d_%H%M%S}.sqlite"
+                if DB_PATH.exists():
+                    shutil.copy2(DB_PATH, backup_path)
+                self.send_json({"ok": True, "backup": str(backup_path), "durable": db_is_durable()})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=500)
+            return
+        self.send_json({"ok": False, "error": "Route inconnue"}, status=404)
 
     def do_PUT(self):
         path = urlparse(self.path).path
         if path == "/api/state":
+            if not self.require_auth():
+                return
             try:
                 payload = self.read_json()
                 save_state(payload.get("data", payload))
                 self.send_json({"ok": True, "database": str(DB_PATH)})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=500)
+            return
+        if path == "/api/import":
+            if not self.require_auth():
+                return
+            try:
+                payload = self.read_json()
+                data = payload.get("data", payload)
+                save_state(data)
+                self.send_json({"ok": True, "database": str(DB_PATH), "data": get_state()})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=500)
             return

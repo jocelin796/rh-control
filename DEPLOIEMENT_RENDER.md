@@ -39,3 +39,22 @@ Le script demandera l’URL HTTPS du dépôt GitHub, par exemple :
 - Disque persistant Render : `1 GB`.
 
 Important : pour conserver les données, le disque persistant Render doit rester activé.
+
+## Après déploiement
+
+Le projet contient maintenant :
+
+- protection optionnelle par mot de passe ;
+- export/import JSON des données RH ;
+- sauvegarde serveur ;
+- diagnostic visuel pour savoir si la base est durable ou temporaire.
+
+Variables recommandées dans Render :
+
+- `APP_PASSWORD` : mot de passe d’accès ;
+- `APP_SESSION_SECRET` : secret long et aléatoire ;
+- `RH_DATABASE_PATH=/var/data/rh_control.sqlite` quand le disque persistant est activé.
+
+Si le service est encore sur plan gratuit sans disque, utiliser temporairement :
+
+`RH_DATABASE_PATH=/tmp/rh_control.sqlite`
