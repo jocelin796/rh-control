@@ -3,13 +3,9 @@ services:
     name: rh-control
     runtime: python
     rootDir: application-rh
-    plan: starter
+    plan: free
     buildCommand: python -m pip install -r requirements.txt
     startCommand: python server.py
     envVars:
       - key: RH_DATABASE_PATH
-        value: /var/data/rh_control.sqlite
-    disk:
-      name: rh-control-data
-      mountPath: /var/data
-      sizeGB: 1
+        value: /tmp/rh_control.sqlite
