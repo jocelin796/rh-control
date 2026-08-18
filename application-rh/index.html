@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RH Alertes & Congés</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">RH</div>
+          <div>
+            <h1>RH Control</h1>
+            <p>Contrats · Congés · Alertes</p>
+          </div>
+        </div>
+
+        <nav class="nav" aria-label="Navigation principale">
+          <button class="nav-link active" data-view="dashboard">Tableau de bord</button>
+          <button class="nav-link" data-view="employees">Collaborateurs</button>
+          <button class="nav-link" data-view="contracts">Contrats</button>
+          <button class="nav-link" data-view="leaves">Congés</button>
+          <button class="nav-link" data-view="calendar">Calendrier</button>
+          <button class="nav-link" data-view="returns">Reprises</button>
+          <button class="nav-link" data-view="alerts">Alertes RH</button>
+          <button class="nav-link" data-view="settings">Paramétrage</button>
+          <button class="nav-link" data-view="history">Historique</button>
+        </nav>
+
+        <div class="sidebar-card">
+          <span class="label">Rôle actif</span>
+          <select id="roleSelect">
+            <option value="Collaborateur">Collaborateur</option>
+            <option value="Assistant RH">Assistant RH</option>
+            <option value="Direction">Direction</option>
+            <option value="Admin RH">Admin RH</option>
+          </select>
+          <p>Les actions visibles changent selon le rôle sélectionné.</p>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">Module fonctionnel RH</p>
+            <h2 id="pageTitle">Tableau de bord</h2>
+          </div>
+          <div class="topbar-actions">
+            <input id="globalSearch" type="search" placeholder="Rechercher un nom, matricule, service..." />
+            <button class="ghost" id="resetDemo">Réinitialiser la démo</button>
+          </div>
+        </header>
+
+        <section id="appContent" class="content" aria-live="polite"></section>
+      </main>
+    </div>
+
+    <div id="modal" class="modal hidden" role="dialog" aria-modal="true"></div>
+    <div id="toast" class="toast hidden"></div>
+
+    <script src="app.js"></script>
+  </body>
+</html>

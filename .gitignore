@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# Base locale et sauvegardes : ne pas envoyer sur GitHub/Render
+application-rh/database/*.sqlite
+application-rh/database/*.sqlite-*
+application-rh/database/backups/
+
+# Fichiers système Windows
+Thumbs.db
+desktop.ini
