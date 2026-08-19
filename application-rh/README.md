@@ -106,6 +106,10 @@ Il est toujours possible d’ouvrir `index.html` directement, mais dans ce mode 
 
 - Tableau de bord RH avec indicateurs clés.
 - Fiches collaborateurs avec contrat et solde de congés.
+- Import Excel des collaborateurs par matricule Zeus.
+- Portail salarié : connexion par matricule, demande de congé et suivi.
+- Demande de documents RH : attestation de travail, domiciliation de salaire, bulletin, fiche de congé, attestation de départ en congé annuel, certificat de travail et autres demandes.
+- Modèles de documents paramétrables avec remplissage automatique.
 - Suivi des contrats avec alertes d’échéance.
 - Renouvellement de contrat avec conservation de l’historique.
 - Formulaire de demande de congé.
@@ -120,6 +124,53 @@ Il est toujours possible d’ouvrir `index.html` directement, mais dans ce mode 
 - Alertes RH centralisées.
 - Paramétrage des délais d’alerte.
 - Historique et traçabilité des actions.
+
+## Import Excel des collaborateurs
+
+Dans `Collaborateurs`, cliquer sur `Télécharger modèle Excel`, remplir le fichier, puis cliquer sur `Importer Excel`.
+
+Le matricule Zeus est la clé :
+
+- si le matricule existe déjà, la fiche est mise à jour ;
+- si le matricule n’existe pas, un nouveau collaborateur est créé.
+
+Colonnes prévues :
+
+- Noms et prénoms
+- Matricule
+- Date d’embauche
+- Date de naissance
+- Numéro de téléphone
+- Adresse mail
+- Numéro CNPS
+- Type de contrat
+- Fonctions
+- Ville de fonction
+- Département
+- Situation matrimoniale
+- Nombre d’enfants
+- Date de début de contrat en cours
+- Date de fin de contrat en cours
+- Soldes de congé à date
+- Solde de congé déjà pris
+- Date de départ
+- Salaire
+
+## Portail salarié
+
+Sur l’écran de connexion, le salarié saisit uniquement son matricule Zeus. Il peut ensuite :
+
+- faire une demande de congé ;
+- faire une demande de document ;
+- suivre le statut de ses demandes.
+
+## Modèles de documents
+
+Dans `Paramétrage`, la section `Modèles de documents` permet de coller ou modifier les modèles.
+
+Variables disponibles :
+
+`{{nom_complet}}`, `{{matricule}}`, `{{fonction}}`, `{{departement}}`, `{{ville_fonction}}`, `{{type_contrat}}`, `{{date_embauche}}`, `{{date_naissance}}`, `{{date_debut_contrat}}`, `{{date_fin_contrat}}`, `{{date_depart}}`, `{{salaire}}`, `{{telephone}}`, `{{email}}`, `{{cnps}}`, `{{situation_matrimoniale}}`, `{{nombre_enfants}}`, `{{solde_conge}}`, `{{conge_pris}}`, `{{precision}}`, `{{date_jour}}`.
 
 ## Données
 

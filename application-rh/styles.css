@@ -311,6 +311,13 @@ button:disabled {
   gap: 6px;
 }
 
+.columns-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
 .form-grid span,
 .settings-grid span {
   color: var(--text);
@@ -614,6 +621,12 @@ tr:hover td {
 textarea {
   min-height: 96px;
   resize: vertical;
+}
+
+.large-textarea {
+  min-height: 260px;
+  font-family: Consolas, "Courier New", monospace;
+  line-height: 1.45;
 }
 
 @media (max-width: 1050px) {

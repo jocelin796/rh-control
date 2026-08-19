@@ -9,8 +9,11 @@ import shutil
 import sqlite3
 import sys
 import time
+import unicodedata
+import uuid
 import webbrowser
-from datetime import datetime
+from datetime import date, datetime, timedelta
+from io import BytesIO
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -20,6 +23,14 @@ try:
     import psycopg
 except ImportError:  # PostgreSQL reste optionnel pour l'utilisation locale SQLite.
     psycopg = None
+
+try:
+    from openpyxl import Workbook, load_workbook
+    from openpyxl.utils.datetime import from_excel
+except ImportError:  # L'import Excel reste optionnel jusqu'au build Render.
+    Workbook = None
+    load_workbook = None
+    from_excel = None
 
 ROOT = Path(__file__).resolve().parent
 LOCAL_DB_DIR = ROOT / "database"
@@ -39,7 +50,109 @@ PORT = int(os.environ.get("PORT", "8750"))
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 APP_SESSION_SECRET = os.environ.get("APP_SESSION_SECRET") or APP_PASSWORD or "local-dev-session-secret"
 SESSION_COOKIE = "rh_session"
+EMPLOYEE_SESSION_COOKIE = "rh_employee"
 SESSION_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+EMPLOYEE_EXCEL_COLUMNS = [
+    "Noms et prénoms",
+    "Matricule",
+    "Date d’embauche",
+    "Date de naissance",
+    "Numéro de téléphone",
+    "Adresse mail",
+    "Numéro CNPS",
+    "Type de contrat",
+    "Fonctions",
+    "Ville de fonction",
+    "Département",
+    "Situation matrimoniale",
+    "Nombre d’enfants",
+    "Date de début de contrat en cours",
+    "Date de fin de contrat en cours",
+    "Soldes de congé à date",
+    "Solde de congé déjà pris",
+    "Date de départ",
+    "Salaire",
+]
+DOCUMENT_TYPES = [
+    "Attestation de travail",
+    "Domiciliation de salaire",
+    "Bulletin de salaire",
+    "Fiche de congé",
+    "Attestation de départ en congé annuel",
+    "Certificat de travail",
+    "Autres",
+]
+DEFAULT_DOCUMENT_TEMPLATES = {
+    "Attestation de travail": """ATTESTATION DE TRAVAIL
+
+Je soussigné(e), Responsable des Ressources Humaines, atteste que {{nom_complet}}, matricule {{matricule}}, occupe la fonction de {{fonction}} au sein du département {{departement}}.
+
+Type de contrat : {{type_contrat}}
+Date d'embauche : {{date_embauche}}
+Ville de fonction : {{ville_fonction}}
+
+Fait le {{date_jour}}.
+""",
+    "Domiciliation de salaire": """DOMICILIATION DE SALAIRE
+
+Nous attestons que {{nom_complet}}, matricule {{matricule}}, est employé(e) en qualité de {{fonction}}.
+
+Salaire de référence : {{salaire}}
+Département : {{departement}}
+
+Fait le {{date_jour}}.
+""",
+    "Bulletin de salaire": """DEMANDE DE BULLETIN DE SALAIRE
+
+Collaborateur : {{nom_complet}}
+Matricule : {{matricule}}
+Fonction : {{fonction}}
+Période / précision : {{precision}}
+
+Fait le {{date_jour}}.
+""",
+    "Fiche de congé": """FICHE DE CONGÉ
+
+Collaborateur : {{nom_complet}}
+Matricule : {{matricule}}
+Fonction : {{fonction}}
+Département : {{departement}}
+Solde de congé à date : {{solde_conge}} jour(s)
+Solde déjà pris : {{conge_pris}} jour(s)
+
+Précision : {{precision}}
+Fait le {{date_jour}}.
+""",
+    "Attestation de départ en congé annuel": """ATTESTATION DE DÉPART EN CONGÉ ANNUEL
+
+Nous attestons que {{nom_complet}}, matricule {{matricule}}, part en congé annuel selon les informations validées par l'administration RH.
+
+Fonction : {{fonction}}
+Département : {{departement}}
+Précision : {{precision}}
+
+Fait le {{date_jour}}.
+""",
+    "Certificat de travail": """CERTIFICAT DE TRAVAIL
+
+Nous certifions que {{nom_complet}}, matricule {{matricule}}, a travaillé au sein de l'entreprise.
+
+Date d'embauche : {{date_embauche}}
+Date de départ : {{date_depart}}
+Fonction : {{fonction}}
+Département : {{departement}}
+
+Fait le {{date_jour}}.
+""",
+    "Autres": """DOCUMENT RH
+
+Collaborateur : {{nom_complet}}
+Matricule : {{matricule}}
+Objet / précision : {{precision}}
+
+Fait le {{date_jour}}.
+""",
+}
 DEFAULT_SETTINGS = {
     "contractAlertDays": [90, 60, 30, 15, 7],
     "returnAlertDays": [3, 1, 0],
@@ -56,7 +169,9 @@ def default_state() -> dict:
         "settings": dict(DEFAULT_SETTINGS),
         "employees": [],
         "leaveRequests": [],
+        "documentRequests": [],
         "documents": [],
+        "documentTemplates": dict(DEFAULT_DOCUMENT_TEMPLATES),
         "auditLog": [],
     }
 
@@ -79,7 +194,13 @@ def normalize_state(value: Any) -> dict:
         settings.update(incoming_settings)
     state["settings"] = settings
 
-    for key in ["employees", "leaveRequests", "documents", "auditLog"]:
+    templates = dict(DEFAULT_DOCUMENT_TEMPLATES)
+    incoming_templates = value.get("documentTemplates")
+    if isinstance(incoming_templates, dict):
+        templates.update({str(k): str(v) for k, v in incoming_templates.items()})
+    state["documentTemplates"] = templates
+
+    for key in ["employees", "leaveRequests", "documentRequests", "documents", "auditLog"]:
         items = value.get(key)
         state[key] = items if isinstance(items, list) else []
 
@@ -159,6 +280,308 @@ def backup_root() -> Path:
     return DB_DIR / "backups"
 
 
+def normalize_lookup(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    text = "".join(
+        char for char in unicodedata.normalize("NFKD", text)
+        if not unicodedata.combining(char)
+    )
+    return "".join(char for char in text if char.isalnum())
+
+
+def find_employee_by_matricule(data: dict, matricule: str) -> dict | None:
+    target = normalize_lookup(matricule)
+    for employee in data.get("employees", []):
+        if normalize_lookup(employee.get("matricule")) == target:
+            return employee
+    return None
+
+
+def find_employee_by_id(data: dict, employee_id: str) -> dict | None:
+    for employee in data.get("employees", []):
+        if employee.get("id") == employee_id:
+            return employee
+    return None
+
+
+def parse_excel_date(value: Any) -> str:
+    if value is None or value == "":
+        return ""
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, (int, float)) and from_excel is not None:
+        try:
+            return from_excel(value).date().isoformat()
+        except Exception:
+            return ""
+    text = str(value).strip()
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y"):
+        try:
+            return datetime.strptime(text, fmt).date().isoformat()
+        except ValueError:
+            continue
+    return text
+
+
+def parse_number(value: Any) -> float:
+    if value is None or value == "":
+        return 0
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace("\u00a0", "").replace(" ", "").replace(",", ".")
+    try:
+        return float(text)
+    except ValueError:
+        return 0
+
+
+def split_full_name(full_name: str) -> tuple[str, str]:
+    parts = str(full_name or "").strip().split()
+    if not parts:
+        return "", ""
+    if len(parts) == 1:
+        return parts[0], ""
+    last_name = parts[0]
+    first_name = " ".join(parts[1:])
+    return first_name, last_name
+
+
+def row_get(row: dict[str, Any], *aliases: str) -> Any:
+    for alias in aliases:
+        key = normalize_lookup(alias)
+        if key in row and row[key] not in (None, ""):
+            return row[key]
+    return ""
+
+
+def employee_from_excel_row(row: dict[str, Any], existing: dict | None = None) -> dict | None:
+    matricule = str(row_get(row, "Matricule", "Matricule Zeus")).strip()
+    if not matricule:
+        return None
+
+    full_name = str(row_get(row, "Noms et prénoms", "Nom et prénoms", "Nom complet", "Collaborateur")).strip()
+    first_name = str(row_get(row, "Prénom", "Prénoms", "Prenom", "Prenoms")).strip()
+    last_name = str(row_get(row, "Nom", "Noms")).strip()
+    if full_name and (not first_name or not last_name):
+        first_name, last_name = split_full_name(full_name)
+
+    hire_date = parse_excel_date(row_get(row, "Date d’embauche", "Date d'embauche", "Date embauche"))
+    birth_date = parse_excel_date(row_get(row, "Date de naissance", "Naissance"))
+    contract_start = parse_excel_date(row_get(row, "Date de début de contrat en cours", "Date debut contrat", "Début contrat"))
+    contract_end = parse_excel_date(row_get(row, "Date de fin de contrat en cours", "Date fin contrat", "Fin contrat"))
+    departure_date = parse_excel_date(row_get(row, "Date de départ", "Date depart", "Départ"))
+
+    leave_available = parse_number(row_get(row, "Soldes de congé à date", "Solde de congé à date", "Solde congé à date", "Solde conge"))
+    leave_taken = parse_number(row_get(row, "Solde de congé déjà pris", "Congé déjà pris", "Conge deja pris", "Congés pris"))
+    initial_leave = leave_available + leave_taken if leave_taken else leave_available
+
+    service = str(row_get(row, "Département", "Departement", "Service")).strip()
+    city = str(row_get(row, "Ville de fonction", "Ville", "Agence")).strip()
+    fonction = str(row_get(row, "Fonctions", "Fonction", "Poste")).strip()
+    contract_type = str(row_get(row, "Type de contrat", "Contrat")).strip() or "Autre"
+    salary = parse_number(row_get(row, "Salaire", "Rémunération", "Remuneration"))
+
+    employee_id = existing.get("id") if existing else f"emp-{uuid.uuid4().hex[:12]}"
+    contract_id = ""
+    existing_contracts = existing.get("contracts", []) if existing else []
+    if existing_contracts:
+        contract_id = existing_contracts[-1].get("id", "")
+    if not contract_id:
+        contract_id = f"ctr-{uuid.uuid4().hex[:12]}"
+
+    previous_history = []
+    if existing_contracts:
+        previous_history = existing_contracts[-1].get("history", [])
+
+    employee = {
+        "id": employee_id,
+        "matricule": matricule,
+        "firstName": first_name,
+        "lastName": last_name,
+        "hireDate": hire_date,
+        "birthDate": birth_date,
+        "phone": str(row_get(row, "Numéro de téléphone", "Numero de telephone", "Téléphone", "Telephone")).strip(),
+        "email": str(row_get(row, "Adresse mail", "Email", "Adresse email", "Mail")).strip(),
+        "cnpsNumber": str(row_get(row, "Numéro CNPS", "Numero CNPS", "CNPS")).strip(),
+        "service": service,
+        "direction": existing.get("direction", "") if existing else service,
+        "agency": city,
+        "fonction": fonction,
+        "maritalStatus": str(row_get(row, "Situation matrimoniale", "Situations matrimoniales", "Situation familiale")).strip(),
+        "childrenCount": int(parse_number(row_get(row, "Nombre d’enfants", "Nombre enfants", "Enfants"))),
+        "departureDate": departure_date,
+        "status": "Sorti" if departure_date else "Actif",
+        "leaveBalance": {
+            "initial": initial_leave,
+            "acquired": 0,
+            "taken": leave_taken,
+            "planned": existing.get("leaveBalance", {}).get("planned", 0) if existing else 0,
+            "available": leave_available,
+        },
+        "contracts": [
+            {
+                "id": contract_id,
+                "type": contract_type,
+                "start": contract_start or hire_date,
+                "end": contract_end,
+                "duration": "",
+                "fonction": fonction,
+                "service": service,
+                "salary": salary,
+                "renewalDate": existing_contracts[-1].get("renewalDate", "") if existing_contracts else "",
+                "renewalCount": existing_contracts[-1].get("renewalCount", 0) if existing_contracts else 0,
+                "document": existing_contracts[-1].get("document", "") if existing_contracts else "",
+                "status": "Contrat actif",
+                "history": previous_history + [f"{datetime.now():%d/%m/%Y} : fiche mise à jour par import Excel."],
+            }
+        ],
+    }
+    return employee
+
+
+def import_employees_from_excel(content: bytes) -> dict:
+    if load_workbook is None:
+        raise RuntimeError("La lecture Excel n'est pas disponible. Vérifiez la dépendance openpyxl.")
+
+    workbook = load_workbook(filename=BytesIO(content), data_only=True)
+    sheet = workbook.active
+    header_cells = next(sheet.iter_rows(min_row=1, max_row=1, values_only=True), None)
+    if not header_cells:
+        raise RuntimeError("Le fichier Excel ne contient pas d'en-têtes.")
+
+    headers = [normalize_lookup(value) for value in header_cells]
+    data = get_state()
+    existing_by_matricule = {
+        normalize_lookup(employee.get("matricule")): employee
+        for employee in data.get("employees", [])
+    }
+
+    created = 0
+    updated = 0
+    skipped = 0
+
+    for excel_row in sheet.iter_rows(min_row=2, values_only=True):
+        if not any(cell not in (None, "") for cell in excel_row):
+            continue
+        row = {headers[index]: excel_row[index] for index in range(min(len(headers), len(excel_row)))}
+        matricule = str(row_get(row, "Matricule", "Matricule Zeus")).strip()
+        if not matricule:
+            skipped += 1
+            continue
+        key = normalize_lookup(matricule)
+        existing = existing_by_matricule.get(key)
+        employee = employee_from_excel_row(row, existing)
+        if not employee:
+            skipped += 1
+            continue
+        if existing:
+            index = data["employees"].index(existing)
+            data["employees"][index] = employee
+            updated += 1
+        else:
+            data["employees"].append(employee)
+            existing_by_matricule[key] = employee
+            created += 1
+
+    data.setdefault("auditLog", []).insert(0, {
+        "date": datetime.now().date().isoformat(),
+        "actor": "Admin RH",
+        "action": f"Import Excel collaborateurs : {created} créé(s), {updated} mis à jour, {skipped} ignoré(s).",
+    })
+    save_state(data)
+    return {"created": created, "updated": updated, "skipped": skipped, "data": get_state()}
+
+
+def build_employee_template_workbook() -> bytes:
+    if Workbook is None:
+        raise RuntimeError("La création du modèle Excel n'est pas disponible.")
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Collaborateurs"
+    sheet.append(EMPLOYEE_EXCEL_COLUMNS)
+    for index, column in enumerate(EMPLOYEE_EXCEL_COLUMNS, start=1):
+        sheet.cell(row=1, column=index).style = "Headline 3"
+        sheet.column_dimensions[sheet.cell(row=1, column=index).column_letter].width = max(18, len(column) + 2)
+    buffer = BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue()
+
+
+def extract_multipart_file(body: bytes, content_type: str) -> bytes:
+    marker = "boundary="
+    if marker not in content_type:
+        raise RuntimeError("Fichier Excel introuvable.")
+    boundary = content_type.split(marker, 1)[1].strip().strip('"')
+    boundary_bytes = ("--" + boundary).encode("utf-8")
+    for part in body.split(boundary_bytes):
+        if b"Content-Disposition" not in part or b'name=\"file\"' not in part:
+            continue
+        if b"\r\n\r\n" not in part:
+            continue
+        _, payload = part.split(b"\r\n\r\n", 1)
+        payload = payload.strip(b"\r\n")
+        if payload.endswith(b"--"):
+            payload = payload[:-2].strip(b"\r\n")
+        return payload
+    raise RuntimeError("Fichier Excel introuvable.")
+
+
+def calc_leave_days_server(settings: dict, start: str, end: str) -> int:
+    try:
+        start_date = datetime.strptime(start, "%Y-%m-%d").date()
+        end_date = datetime.strptime(end, "%Y-%m-%d").date()
+    except ValueError:
+        return 0
+    if end_date < start_date:
+        return 0
+    working_days = set(settings.get("workingDays", [1, 2, 3, 4, 5]))
+    holidays = set(settings.get("holidays", []))
+    count = 0
+    current = start_date
+    while current <= end_date:
+        js_weekday = (current.weekday() + 1) % 7
+        if js_weekday in working_days and current.isoformat() not in holidays:
+            count += 1
+        current += timedelta(days=1)
+    return count
+
+
+def calc_return_date_server(settings: dict, end: str) -> str:
+    try:
+        current = datetime.strptime(end, "%Y-%m-%d").date() + timedelta(days=1)
+    except ValueError:
+        return ""
+    working_days = set(settings.get("workingDays", [1, 2, 3, 4, 5]))
+    holidays = set(settings.get("holidays", []))
+    while True:
+        js_weekday = (current.weekday() + 1) % 7
+        if js_weekday in working_days and current.isoformat() not in holidays:
+            return current.isoformat()
+        current += timedelta(days=1)
+
+
+def employee_portal_payload(data: dict, employee: dict) -> dict:
+    employee_id = employee.get("id")
+    return {
+        "employee": employee,
+        "settings": data.get("settings", {}),
+        "leaveRequests": [
+            leave for leave in data.get("leaveRequests", [])
+            if leave.get("employeeId") == employee_id
+        ],
+        "documentRequests": [
+            request for request in data.get("documentRequests", [])
+            if request.get("employeeId") == employee_id
+        ],
+        "documents": [
+            document for document in data.get("documents", [])
+            if document.get("employeeId") == employee_id
+        ],
+    }
+
+
 def auth_required() -> bool:
     return bool(APP_PASSWORD)
 
@@ -175,6 +598,21 @@ def create_session_cookie() -> str:
     if os.environ.get("RENDER"):
         flags += "; Secure"
     return f"{SESSION_COOKIE}={token}; {flags}"
+
+
+def cookie_flags(max_age: int) -> str:
+    flags = f"HttpOnly; Path=/; SameSite=Lax; Max-Age={max_age}"
+    if os.environ.get("RENDER"):
+        flags += "; Secure"
+    return flags
+
+
+def create_employee_session_cookie(employee_id: str) -> str:
+    issued_at = str(int(time.time()))
+    payload = f"employee:{employee_id}:{issued_at}"
+    signature = sign_session(payload)
+    token = base64.urlsafe_b64encode(f"{employee_id}:{issued_at}:{signature}".encode("utf-8")).decode("ascii")
+    return f"{EMPLOYEE_SESSION_COOKIE}={token}; {cookie_flags(SESSION_MAX_AGE_SECONDS)}"
 
 
 def parse_cookie(header: str | None) -> dict[str, str]:
@@ -205,6 +643,23 @@ def verify_session_cookie(header: str | None) -> bool:
         return True
     except Exception:
         return False
+
+
+def verify_employee_session_cookie(header: str | None) -> str | None:
+    token = parse_cookie(header).get(EMPLOYEE_SESSION_COOKIE)
+    if not token:
+        return None
+    try:
+        decoded = base64.urlsafe_b64decode(token.encode("ascii")).decode("utf-8")
+        employee_id, issued_at, signature = decoded.split(":", 2)
+        payload = f"employee:{employee_id}:{issued_at}"
+        if not hmac.compare_digest(signature, sign_session(payload)):
+            return None
+        if time.time() - int(issued_at) > SESSION_MAX_AGE_SECONDS:
+            return None
+        return employee_id
+    except Exception:
+        return None
 
 
 def rows(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
@@ -377,13 +832,18 @@ def get_state() -> dict:
         default_settings.update(settings)
 
         role_row = one(conn, "SELECT value FROM app_meta WHERE key = ?", ("current_role",))
+        full_state_row = one(conn, "SELECT value FROM app_meta WHERE key = ?", ("full_state_json",))
+        if full_state_row:
+            return normalize_state(full_state_row["value"])
 
         return {
             "currentRole": role_row["value"] if role_row else "Admin RH",
             "settings": default_settings,
             "employees": employees,
             "leaveRequests": leave_requests,
+            "documentRequests": [],
             "documents": documents,
+            "documentTemplates": dict(DEFAULT_DOCUMENT_TEMPLATES),
             "auditLog": audit_log,
         }
 
@@ -555,6 +1015,10 @@ def save_state(data: dict) -> None:
                 ),
             )
 
+        conn.execute(
+            "INSERT OR REPLACE INTO app_meta(key, value) VALUES (?, ?)",
+            ("full_state_json", json.dumps(normalize_state(data), ensure_ascii=False)),
+        )
         conn.commit()
 
 
@@ -595,6 +1059,29 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_binary_download(self, filename: str, body: bytes, content_type: str) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def employee_id_from_cookie(self) -> str | None:
+        return verify_employee_session_cookie(self.headers.get("Cookie"))
+
+    def require_employee(self) -> tuple[dict, dict] | None:
+        employee_id = self.employee_id_from_cookie()
+        if not employee_id:
+            self.send_json({"ok": False, "error": "Connexion salarié requise"}, status=401)
+            return None
+        data = get_state()
+        employee = find_employee_by_id(data, employee_id)
+        if not employee:
+            self.send_json({"ok": False, "error": "Matricule introuvable"}, status=401)
+            return None
+        return data, employee
+
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/api/health":
@@ -613,6 +1100,16 @@ class Handler(SimpleHTTPRequestHandler):
                 "authenticated": self.is_authenticated(),
             })
             return
+        if path == "/api/employee/status":
+            employee_id = self.employee_id_from_cookie()
+            data = get_state()
+            employee = find_employee_by_id(data, employee_id) if employee_id else None
+            self.send_json({
+                "ok": True,
+                "authenticated": bool(employee),
+                "employee": employee,
+            })
+            return
         if path == "/api/bootstrap":
             if not self.require_auth():
                 return
@@ -628,6 +1125,26 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             self.send_json_download(f"rh_control_export_{stamp}.json", get_state())
+            return
+        if path == "/api/employees/template":
+            if not self.require_auth():
+                return
+            try:
+                body = build_employee_template_workbook()
+                self.send_binary_download(
+                    "modele_import_collaborateurs.xlsx",
+                    body,
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=500)
+            return
+        if path == "/api/employee/bootstrap":
+            result = self.require_employee()
+            if not result:
+                return
+            data, employee = result
+            self.send_json({"ok": True, "data": employee_portal_payload(data, employee)})
             return
         return super().do_GET()
 
@@ -649,6 +1166,109 @@ class Handler(SimpleHTTPRequestHandler):
                 {"ok": True},
                 extra_headers={"Set-Cookie": f"{SESSION_COOKIE}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0"},
             )
+            return
+        if path == "/api/employee/login":
+            payload = self.read_json()
+            matricule = str(payload.get("matricule", "")).strip()
+            data = get_state()
+            employee = find_employee_by_matricule(data, matricule)
+            if not employee:
+                self.send_json({"ok": False, "error": "Matricule introuvable"}, status=401)
+                return
+            self.send_json(
+                {"ok": True, "data": employee_portal_payload(data, employee)},
+                extra_headers={"Set-Cookie": create_employee_session_cookie(employee["id"])},
+            )
+            return
+        if path == "/api/employee/logout":
+            self.send_json(
+                {"ok": True},
+                extra_headers={"Set-Cookie": f"{EMPLOYEE_SESSION_COOKIE}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0"},
+            )
+            return
+        if path == "/api/employee/leave":
+            result = self.require_employee()
+            if not result:
+                return
+            data, employee = result
+            payload = self.read_json()
+            start = str(payload.get("start", "")).strip()
+            end = str(payload.get("end", "")).strip()
+            days = calc_leave_days_server(data.get("settings", {}), start, end)
+            if not start or not end or days <= 0:
+                self.send_json({"ok": False, "error": "Dates de congé invalides"}, status=400)
+                return
+            available = float(employee.get("leaveBalance", {}).get("available", 0) or 0)
+            if days > available and not data.get("settings", {}).get("allowExceptionalLeave", True):
+                self.send_json({"ok": False, "error": "Solde de congé insuffisant"}, status=400)
+                return
+            leave = {
+                "id": f"leave-{uuid.uuid4().hex[:12]}",
+                "employeeId": employee["id"],
+                "type": str(payload.get("type", "Congé annuel")).strip() or "Congé annuel",
+                "start": start,
+                "end": end,
+                "returnDate": calc_return_date_server(data.get("settings", {}), end),
+                "days": days,
+                "reason": str(payload.get("reason", "")).strip(),
+                "comment": str(payload.get("comment", "")).strip(),
+                "attachment": str(payload.get("attachment", "")).strip(),
+                "status": "Demande envoyée",
+                "observations": [],
+                "createdAt": datetime.now().date().isoformat(),
+                "history": [f"{datetime.now():%d/%m/%Y} : demande envoyée par le collaborateur."],
+            }
+            data.setdefault("leaveRequests", []).insert(0, leave)
+            data.setdefault("auditLog", []).insert(0, {
+                "date": datetime.now().date().isoformat(),
+                "actor": "Collaborateur",
+                "action": f"{employee.get('firstName', '')} {employee.get('lastName', '')} a envoyé une demande de congé.",
+            })
+            save_state(data)
+            refreshed = get_state()
+            refreshed_employee = find_employee_by_id(refreshed, employee["id"]) or employee
+            self.send_json({"ok": True, "data": employee_portal_payload(refreshed, refreshed_employee)})
+            return
+        if path == "/api/employee/document-request":
+            result = self.require_employee()
+            if not result:
+                return
+            data, employee = result
+            payload = self.read_json()
+            request_type = str(payload.get("type", "")).strip() or "Autres"
+            details = str(payload.get("details", "")).strip()
+            request = {
+                "id": f"docreq-{uuid.uuid4().hex[:12]}",
+                "employeeId": employee["id"],
+                "type": request_type,
+                "details": details,
+                "status": "Demande envoyée",
+                "createdAt": datetime.now().date().isoformat(),
+                "content": "",
+                "history": [f"{datetime.now():%d/%m/%Y} : demande envoyée par le salarié."],
+            }
+            data.setdefault("documentRequests", []).insert(0, request)
+            data.setdefault("auditLog", []).insert(0, {
+                "date": datetime.now().date().isoformat(),
+                "actor": "Collaborateur",
+                "action": f"Demande de document '{request_type}' envoyée par {employee.get('matricule', '')}.",
+            })
+            save_state(data)
+            refreshed = get_state()
+            refreshed_employee = find_employee_by_id(refreshed, employee["id"]) or employee
+            self.send_json({"ok": True, "data": employee_portal_payload(refreshed, refreshed_employee)})
+            return
+        if path == "/api/employees/import-excel":
+            if not self.require_auth():
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length)
+                content = extract_multipart_file(body, self.headers.get("Content-Type", ""))
+                result = import_employees_from_excel(content)
+                self.send_json({"ok": True, **result})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=500)
             return
         if path == "/api/backup":
             if not self.require_auth():

@@ -7,11 +7,87 @@ const viewTitles = {
   employees: "Collaborateurs",
   contracts: "Contrats",
   leaves: "Congés",
+  documents: "Documents RH",
   calendar: "Calendrier",
   returns: "Reprises de congé",
   alerts: "Alertes RH",
   settings: "Paramétrage",
   history: "Historique",
+};
+
+const DOCUMENT_TYPES = [
+  "Attestation de travail",
+  "Domiciliation de salaire",
+  "Bulletin de salaire",
+  "Fiche de congé",
+  "Attestation de départ en congé annuel",
+  "Certificat de travail",
+  "Autres",
+];
+
+const DEFAULT_DOCUMENT_TEMPLATES = {
+  "Attestation de travail": `ATTESTATION DE TRAVAIL
+
+Je soussigné(e), Responsable des Ressources Humaines, atteste que {{nom_complet}}, matricule {{matricule}}, occupe la fonction de {{fonction}} au sein du département {{departement}}.
+
+Type de contrat : {{type_contrat}}
+Date d'embauche : {{date_embauche}}
+Ville de fonction : {{ville_fonction}}
+
+Fait le {{date_jour}}.`,
+  "Domiciliation de salaire": `DOMICILIATION DE SALAIRE
+
+Nous attestons que {{nom_complet}}, matricule {{matricule}}, est employé(e) en qualité de {{fonction}}.
+
+Salaire de référence : {{salaire}}
+Département : {{departement}}
+
+Fait le {{date_jour}}.`,
+  "Bulletin de salaire": `DEMANDE DE BULLETIN DE SALAIRE
+
+Collaborateur : {{nom_complet}}
+Matricule : {{matricule}}
+Fonction : {{fonction}}
+Période / précision : {{precision}}
+
+Fait le {{date_jour}}.`,
+  "Fiche de congé": `FICHE DE CONGÉ
+
+Collaborateur : {{nom_complet}}
+Matricule : {{matricule}}
+Fonction : {{fonction}}
+Département : {{departement}}
+Solde de congé à date : {{solde_conge}} jour(s)
+Solde déjà pris : {{conge_pris}} jour(s)
+
+Précision : {{precision}}
+Fait le {{date_jour}}.`,
+  "Attestation de départ en congé annuel": `ATTESTATION DE DÉPART EN CONGÉ ANNUEL
+
+Nous attestons que {{nom_complet}}, matricule {{matricule}}, part en congé annuel selon les informations validées par l'administration RH.
+
+Fonction : {{fonction}}
+Département : {{departement}}
+Précision : {{precision}}
+
+Fait le {{date_jour}}.`,
+  "Certificat de travail": `CERTIFICAT DE TRAVAIL
+
+Nous certifions que {{nom_complet}}, matricule {{matricule}}, a travaillé au sein de l'entreprise.
+
+Date d'embauche : {{date_embauche}}
+Date de départ : {{date_depart}}
+Fonction : {{fonction}}
+Département : {{departement}}
+
+Fait le {{date_jour}}.`,
+  "Autres": `DOCUMENT RH
+
+Collaborateur : {{nom_complet}}
+Matricule : {{matricule}}
+Objet / précision : {{precision}}
+
+Fait le {{date_jour}}.`,
 };
 
 const state = {
@@ -26,6 +102,7 @@ const state = {
   authenticated: false,
   durableDatabase: false,
   databasePath: "",
+  employeePortal: { active: false, data: null },
   data: loadState(),
 };
 
@@ -42,15 +119,35 @@ function defaultState() {
     },
     employees: [],
     leaveRequests: [],
+    documentRequests: [],
     documents: [],
+    documentTemplates: { ...DEFAULT_DOCUMENT_TEMPLATES },
     auditLog: [],
+  };
+}
+
+function normalizeData(data) {
+  const base = defaultState();
+  const incoming = data && typeof data === "object" ? data : {};
+  const settings = { ...base.settings, ...(incoming.settings || {}) };
+  const templates = { ...DEFAULT_DOCUMENT_TEMPLATES, ...(incoming.documentTemplates || {}) };
+  return {
+    ...base,
+    ...incoming,
+    settings,
+    employees: Array.isArray(incoming.employees) ? incoming.employees : [],
+    leaveRequests: Array.isArray(incoming.leaveRequests) ? incoming.leaveRequests : [],
+    documentRequests: Array.isArray(incoming.documentRequests) ? incoming.documentRequests : [],
+    documents: Array.isArray(incoming.documents) ? incoming.documents : [],
+    documentTemplates: templates,
+    auditLog: Array.isArray(incoming.auditLog) ? incoming.auditLog : [],
   };
 }
 
 function loadState() {
   try {
     const saved = localStorage.getItem(STORAGE_KEY);
-    return saved ? JSON.parse(saved) : defaultState();
+    return saved ? normalizeData(JSON.parse(saved)) : defaultState();
   } catch {
     return defaultState();
   }
@@ -117,6 +214,17 @@ async function initApp() {
       state.authRequired = Boolean(auth.authRequired);
       state.authenticated = Boolean(auth.authenticated);
       if (state.authRequired && !state.authenticated) {
+        const employeeStatus = await fetch("/api/employee/status", { credentials: "same-origin" });
+        const employeeAuth = await employeeStatus.json().catch(() => ({}));
+        if (employeeAuth.authenticated) {
+          const employeeResponse = await fetch("/api/employee/bootstrap", { credentials: "same-origin" });
+          const employeePayload = await employeeResponse.json().catch(() => ({}));
+          if (employeeResponse.ok && employeePayload.ok) {
+            state.employeePortal = { active: true, data: employeePayload.data };
+            renderEmployeePortal();
+            return;
+          }
+        }
         renderLogin();
         return;
       }
@@ -126,7 +234,7 @@ async function initApp() {
     const payload = await response.json();
     state.databasePath = payload.database || "";
     state.durableDatabase = Boolean(payload.durable);
-    state.data = payload.data || defaultState();
+    state.data = normalizeData(payload.data || defaultState());
     state.apiReady = true;
     state.authenticated = true;
     render();
@@ -156,6 +264,23 @@ function renderLogin() {
         </label>
         <div class="toolbar full">
           <button class="primary" type="submit">Se connecter</button>
+        </div>
+      </form>
+    </section>
+    <section class="panel">
+      <div class="panel-header">
+        <div>
+          <h3>Espace salarié</h3>
+          <p>Chaque collaborateur se connecte avec son matricule Zeus pour faire ses demandes et suivre l’avancement.</p>
+        </div>
+      </div>
+      <form id="employeeLoginForm" class="form-grid">
+        <label class="full">
+          <span>Matricule Zeus</span>
+          <input id="employeeLoginMatricule" placeholder="Exemple : ZEUS001" autocomplete="username" required>
+        </label>
+        <div class="toolbar full">
+          <button class="secondary" type="submit">Entrer dans mon espace</button>
         </div>
       </form>
     </section>
@@ -225,7 +350,7 @@ function money(value) {
 }
 
 function fullName(employee) {
-  return `${employee.firstName} ${employee.lastName}`;
+  return `${employee.firstName || ""} ${employee.lastName || ""}`.trim() || employee.matricule || "Collaborateur";
 }
 
 function getEmployee(id) {
@@ -233,7 +358,16 @@ function getEmployee(id) {
 }
 
 function getCurrentContract(employee) {
-  return employee.contracts[employee.contracts.length - 1];
+  const contracts = Array.isArray(employee?.contracts) ? employee.contracts : [];
+  return contracts[contracts.length - 1] || {
+    id: "",
+    type: "Autre",
+    start: "",
+    end: "",
+    salary: 0,
+    history: [],
+    status: "Contrat actif",
+  };
 }
 
 function statusTag(status) {
@@ -242,7 +376,7 @@ function statusTag(status) {
       ? "red"
       : status.includes("renouveler") || status.includes("attente") || status.includes("envoyée") || status.includes("À venir")
         ? "orange"
-        : status.includes("Validé") || status.includes("actif") || status.includes("transmis")
+        : status.includes("Validé") || status.includes("actif") || status.includes("transmis") || status.includes("prêt")
           ? "green"
           : status.includes("Direction")
             ? "purple"
@@ -383,6 +517,19 @@ function generateAlerts() {
       });
     });
 
+  state.data.documentRequests
+    .filter((request) => !["Document transmis", "Refusé"].includes(request.status))
+    .forEach((request) => {
+      const employee = getEmployee(request.employeeId);
+      alerts.push({
+        category: "Documents",
+        level: "purple",
+        title: request.status,
+        detail: `${request.type} — ${employee ? fullName(employee) : "Collaborateur"}`,
+        days: 0,
+      });
+    });
+
   return alerts.sort((a, b) => {
     const order = { red: 0, orange: 1, blue: 2, purple: 3, green: 4, gray: 5 };
     return order[a.level] - order[b.level] || a.days - b.days;
@@ -418,7 +565,9 @@ function metrics() {
     approvedLeaves: leaves.filter((l) => l.status === "Validé").length,
     returnsToday: leaves.filter((l) => l.status === "Validé" && l.returnDate === todayIso).length,
     returnsWeek: leaves.filter((l) => l.status === "Validé" && isThisWeek(l.returnDate)).length,
-    docsToProcess: state.data.documents.filter((doc) => doc.status !== "Document transmis").length,
+    docsToProcess:
+      state.data.documents.filter((doc) => doc.status !== "Document transmis").length
+      + state.data.documentRequests.filter((doc) => !["Document transmis", "Refusé"].includes(doc.status)).length,
     alerts: generateAlerts().length,
   };
 }
@@ -439,6 +588,7 @@ function render() {
     employees: renderEmployees,
     contracts: renderContracts,
     leaves: renderLeaves,
+    documents: renderDocuments,
     calendar: renderCalendar,
     returns: renderReturns,
     alerts: renderAlerts,
@@ -561,9 +711,9 @@ function renderEmployees() {
       const total = Math.max(1, balance.initial + balance.acquired);
       return `
         <tr>
-          <td><strong>${fullName(employee)}</strong><br><span class="muted">${employee.fonction}</span></td>
+          <td><strong>${fullName(employee)}</strong><br><span class="muted">${employee.fonction || "—"}</span></td>
           <td>${employee.matricule}</td>
-          <td>${employee.service}<br><span class="muted">${employee.agency}</span></td>
+          <td>${employee.service || "—"}<br><span class="muted">${employee.agency || "—"} · ${employee.phone || employee.email || "contact non renseigné"}</span></td>
           <td>${contract.type}</td>
           <td>${statusTag(getContractComputedStatus(contract))}</td>
           <td>
@@ -587,7 +737,11 @@ function renderEmployees() {
           <h3>Fiches collaborateurs</h3>
           <p>Contrat, service, fonction, solde de congés et accès rapide à la demande.</p>
         </div>
-        <button class="primary" data-action="add-employee">Ajouter un collaborateur</button>
+        <div class="toolbar">
+          <button class="ghost" data-action="download-excel-template">Télécharger modèle Excel</button>
+          <button class="secondary" data-action="import-excel-modal">Importer Excel</button>
+          <button class="primary" data-action="add-employee">Ajouter un collaborateur</button>
+        </div>
       </div>
       <div class="table-wrap">
         <table>
@@ -782,6 +936,78 @@ function leaveActions(leave) {
   return actions.join("");
 }
 
+function renderDocuments() {
+  const hasEmployees = state.data.employees.length > 0;
+  const employeeOptions = hasEmployees
+    ? state.data.employees
+      .map((employee) => `<option value="${employee.id}">${fullName(employee)} — ${employee.matricule}</option>`)
+      .join("")
+    : `<option value="">Aucun collaborateur enregistré</option>`;
+  const typeOptions = DOCUMENT_TYPES.map((type) => `<option>${type}</option>`).join("");
+  const rows = state.data.documentRequests
+    .filter((request) => {
+      const employee = getEmployee(request.employeeId);
+      return employee && filterText(`${fullName(employee)} ${employee.matricule} ${request.type} ${request.status}`);
+    })
+    .map((request) => {
+      const employee = getEmployee(request.employeeId);
+      return `
+        <tr>
+          <td><strong>${fullName(employee)}</strong><br><span class="muted">${employee.matricule}</span></td>
+          <td>${request.type}</td>
+          <td>${formatDate(request.createdAt)}<br><span class="muted">${request.details || "—"}</span></td>
+          <td>${statusTag(request.status)}</td>
+          <td class="mini-actions">${documentRequestActions(request)}</td>
+        </tr>
+      `;
+    })
+    .join("");
+
+  return `
+    <section class="panel">
+      <div class="panel-header">
+        <div>
+          <h3>Nouvelle demande de document</h3>
+          <p>Création côté RH ou suivi des demandes envoyées par les salariés depuis leur matricule Zeus.</p>
+        </div>
+      </div>
+      <form id="documentRequestForm" class="form-grid">
+        <label><span>Collaborateur</span><select id="docEmployee">${employeeOptions}</select></label>
+        <label><span>Type de document</span><select id="docType">${typeOptions}</select></label>
+        <label class="full"><span>Précision / période / objet</span><textarea id="docDetails" placeholder="Ex : bulletin de juillet 2026, banque, période, précision pour Autres..."></textarea></label>
+        <div class="toolbar full">
+          <button class="primary" type="submit" ${hasEmployees ? "" : "disabled"}>Enregistrer la demande</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <div>
+          <h3>Demandes de documents</h3>
+          <p>Les modèles enregistrés dans Paramétrage remplissent automatiquement les informations du salarié.</p>
+        </div>
+        <button class="ghost" data-go="settings">Gérer les modèles</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Collaborateur</th><th>Document</th><th>Demande</th><th>Statut</th><th>Actions</th></tr></thead>
+          <tbody>${rows || `<tr><td colspan="5">Aucune demande de document.</td></tr>`}</tbody>
+        </table>
+      </div>
+    </section>
+  `;
+}
+
+function documentRequestActions(request) {
+  const actions = [`<button data-action="doc-request-details" data-id="${request.id}">Détails</button>`];
+  if (!request.content) actions.push(`<button data-action="generate-doc-request" data-id="${request.id}">Générer</button>`);
+  if (request.content) actions.push(`<button data-action="download-doc-request" data-id="${request.id}">Télécharger</button>`);
+  if (request.status !== "Document transmis") actions.push(`<button data-action="transmit-doc-request" data-id="${request.id}">Transmis</button>`);
+  if (!["Document transmis", "Refusé"].includes(request.status)) actions.push(`<button data-action="refuse-doc-request" data-id="${request.id}">Refuser</button>`);
+  return actions.join("");
+}
+
 function renderCalendar() {
   const year = state.calendarYear;
   const month = state.calendarMonth;
@@ -951,6 +1177,30 @@ function renderSettings() {
         </div>
       </form>
     </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <div>
+          <h3>Modèles de documents</h3>
+          <p>Colle ici tes modèles. Les variables entre doubles accolades seront remplies automatiquement.</p>
+        </div>
+      </div>
+      <form id="templateForm" class="form-grid">
+        <label><span>Type de document</span>
+          <select id="templateType">
+            ${DOCUMENT_TYPES.map((type) => `<option>${type}</option>`).join("")}
+          </select>
+        </label>
+        <label class="full"><span>Modèle</span><textarea id="templateContent" class="large-textarea">${escapeHtml(state.data.documentTemplates[DOCUMENT_TYPES[0]] || "")}</textarea></label>
+        <div class="hint full">
+          Variables disponibles : {{nom_complet}}, {{matricule}}, {{fonction}}, {{departement}}, {{ville_fonction}}, {{type_contrat}}, {{date_embauche}}, {{date_naissance}}, {{date_debut_contrat}}, {{date_fin_contrat}}, {{date_depart}}, {{salaire}}, {{telephone}}, {{email}}, {{cnps}}, {{situation_matrimoniale}}, {{nombre_enfants}}, {{solde_conge}}, {{conge_pris}}, {{precision}}, {{date_jour}}.
+        </div>
+        <div class="toolbar full">
+          <button class="primary" type="submit">Enregistrer le modèle</button>
+          <button class="ghost" type="button" data-action="restore-template">Remettre le modèle par défaut</button>
+        </div>
+      </form>
+    </section>
   `;
 }
 
@@ -1015,9 +1265,12 @@ function employeeFile(id) {
       <div class="hint">
         <strong>${fullName(employee)}</strong><br>
         Matricule : ${employee.matricule}<br>
-        Service : ${employee.service}<br>
-        Fonction : ${employee.fonction}<br>
-        Agence : ${employee.agency}
+        Département : ${employee.service || "—"}<br>
+        Fonction : ${employee.fonction || "—"}<br>
+        Ville de fonction : ${employee.agency || "—"}<br>
+        Téléphone : ${employee.phone || "—"}<br>
+        Email : ${employee.email || "—"}<br>
+        CNPS : ${employee.cnpsNumber || "—"}
       </div>
       <div class="success">
         <strong>Solde de congés</strong><br>
@@ -1028,6 +1281,14 @@ function employeeFile(id) {
         Disponible : ${employee.leaveBalance.available} j
       </div>
     </div>
+    <h4>Informations personnelles</h4>
+    <p>
+      Date d’embauche : ${formatDate(employee.hireDate)} ·
+      Date de naissance : ${formatDate(employee.birthDate)} ·
+      Situation matrimoniale : ${employee.maritalStatus || "—"} ·
+      Nombre d’enfants : ${employee.childrenCount ?? "—"} ·
+      Date de départ : ${formatDate(employee.departureDate)}
+    </p>
     <h4>Contrat actuel</h4>
     <p>${contract.type} · ${formatDate(contract.start)} → ${formatDate(contract.end)} · ${money(contract.salary)}</p>
     <p>${statusTag(getContractComputedStatus(contract))}</p>
@@ -1065,6 +1326,35 @@ function renewContract(employeeId, contractId) {
   );
 }
 
+function importExcelModal() {
+  openModal(
+    "Importer les collaborateurs depuis Excel",
+    `
+      <div class="hint">
+        L’import utilise le matricule Zeus comme clé. Si le matricule existe déjà, la fiche est mise à jour ; sinon elle est créée.
+      </div>
+      <div class="toolbar">
+        <button class="ghost" data-action="download-excel-template">Télécharger le modèle Excel</button>
+      </div>
+      <form class="form-grid">
+        <label class="full">
+          <span>Fichier Excel .xlsx</span>
+          <input id="employeeExcelFile" type="file" accept=".xlsx,.xlsm,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet">
+        </label>
+      </form>
+      <h4>Colonnes attendues</h4>
+      <div class="columns-list">
+        ${[
+          "Noms et prénoms", "Matricule", "Date d’embauche", "Date de naissance", "Numéro de téléphone",
+          "Adresse mail", "Numéro CNPS", "Type de contrat", "Fonctions", "Ville de fonction",
+          "Département", "Situation matrimoniale", "Nombre d’enfants", "Date de début de contrat en cours",
+          "Date de fin de contrat en cours", "Soldes de congé à date", "Solde de congé déjà pris", "Date de départ", "Salaire",
+        ].map((item) => `<span class="tag gray">${item}</span>`).join("")}
+      </div>
+    `
+  );
+}
+
 function addEmployeeModal() {
   openModal(
     "Ajouter un collaborateur",
@@ -1073,15 +1363,24 @@ function addEmployeeModal() {
         <label><span>Prénom</span><input id="empFirstName" required></label>
         <label><span>Nom</span><input id="empLastName" required></label>
         <label><span>Matricule</span><input id="empMatricule" required></label>
-        <label><span>Service</span><input id="empService" required></label>
+        <label><span>Date d’embauche</span><input id="empHireDate" type="date"></label>
+        <label><span>Date de naissance</span><input id="empBirthDate" type="date"></label>
+        <label><span>Téléphone</span><input id="empPhone"></label>
+        <label><span>Email</span><input id="empEmail" type="email"></label>
+        <label><span>Numéro CNPS</span><input id="empCnps"></label>
+        <label><span>Département</span><input id="empService" required></label>
         <label><span>Direction</span><input id="empDirection" required></label>
-        <label><span>Agence</span><input id="empAgency" required></label>
-        <label><span>Fonction</span><input id="empFonction" required></label>
+        <label><span>Ville de fonction</span><input id="empAgency" required></label>
+        <label><span>Fonctions</span><input id="empFonction" required></label>
+        <label><span>Situation matrimoniale</span><input id="empMaritalStatus"></label>
+        <label><span>Nombre d’enfants</span><input id="empChildrenCount" type="number" value="0"></label>
         <label><span>Type contrat</span><select id="empContractType"><option>CDD</option><option>CDI</option><option>Autre</option></select></label>
         <label><span>Date début</span><input id="empContractStart" type="date" required></label>
         <label><span>Date fin</span><input id="empContractEnd" type="date"></label>
+        <label><span>Date de départ</span><input id="empDepartureDate" type="date"></label>
         <label><span>Salaire</span><input id="empSalary" type="number" value="0"></label>
-        <label><span>Solde disponible</span><input id="empLeaveAvailable" type="number" value="24"></label>
+        <label><span>Solde de congé à date</span><input id="empLeaveAvailable" type="number" value="24"></label>
+        <label><span>Solde congé déjà pris</span><input id="empLeaveTaken" type="number" value="0"></label>
       </form>
     `,
     `<button class="primary" data-action="save-employee">Enregistrer</button>`
@@ -1213,6 +1512,139 @@ function createLeave(event) {
   render();
 }
 
+function createDocumentRequest(event) {
+  event.preventDefault();
+  const employee = getEmployee(document.getElementById("docEmployee").value);
+  if (!employee) {
+    showToast("Ajoute d’abord un collaborateur réel.");
+    return;
+  }
+  const type = document.getElementById("docType").value;
+  const details = document.getElementById("docDetails").value.trim();
+  const request = {
+    id: `docreq-${Date.now()}`,
+    employeeId: employee.id,
+    type,
+    details,
+    status: "Demande envoyée",
+    createdAt: toISO(today()),
+    content: "",
+    history: [`${formatDate(toISO(today()))} : demande enregistrée par RH.`],
+  };
+  state.data.documentRequests.unshift(request);
+  audit("Assistant RH", `Demande de document ${type} enregistrée pour ${fullName(employee)}.`);
+  showToast("Demande de document enregistrée.");
+  render();
+}
+
+function templateVariables(employee, request = {}) {
+  const contract = getCurrentContract(employee);
+  const balance = employee.leaveBalance || {};
+  return {
+    nom_complet: fullName(employee),
+    matricule: employee.matricule || "",
+    fonction: employee.fonction || "",
+    departement: employee.service || "",
+    ville_fonction: employee.agency || "",
+    type_contrat: contract.type || "",
+    date_embauche: formatDate(employee.hireDate),
+    date_naissance: formatDate(employee.birthDate),
+    date_debut_contrat: formatDate(contract.start),
+    date_fin_contrat: formatDate(contract.end),
+    date_depart: formatDate(employee.departureDate),
+    salaire: money(contract.salary),
+    telephone: employee.phone || "",
+    email: employee.email || "",
+    cnps: employee.cnpsNumber || "",
+    situation_matrimoniale: employee.maritalStatus || "",
+    nombre_enfants: employee.childrenCount ?? "",
+    solde_conge: balance.available ?? 0,
+    conge_pris: balance.taken ?? 0,
+    precision: request.details || "",
+    date_jour: formatDate(toISO(today())),
+  };
+}
+
+function fillTemplate(template, employee, request = {}) {
+  const values = templateVariables(employee, request);
+  return String(template || "")
+    .replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (_, key) => values[key] ?? "");
+}
+
+function getDocumentRequest(id) {
+  return state.data.documentRequests.find((item) => item.id === id);
+}
+
+function generateDocumentRequest(id) {
+  const request = getDocumentRequest(id);
+  const employee = getEmployee(request.employeeId);
+  const template = state.data.documentTemplates[request.type] || state.data.documentTemplates.Autres || "";
+  request.content = fillTemplate(template, employee, request);
+  request.status = "Document prêt";
+  request.generatedAt = toISO(today());
+  request.history = request.history || [];
+  request.history.push(`${formatDate(toISO(today()))} : document généré automatiquement depuis le modèle.`);
+  audit("Assistant RH", `${request.type} généré pour ${fullName(employee)}.`);
+  showToast("Document généré depuis le modèle.");
+  render();
+}
+
+function viewDocumentRequest(id) {
+  const request = getDocumentRequest(id);
+  const employee = getEmployee(request.employeeId);
+  const body = `
+    <div class="hint">
+      <strong>${fullName(employee)}</strong> — ${employee.matricule}<br>
+      Document : ${request.type}<br>
+      Statut : ${request.status}<br>
+      Précision : ${request.details || "—"}
+    </div>
+    ${request.content ? `<h4>Contenu généré</h4><pre>${escapeHtml(request.content)}</pre>` : `<div class="warning">Le document n’est pas encore généré.</div>`}
+    <h4>Historique</h4>
+    <ul>${(request.history || []).map((item) => `<li>${item}</li>`).join("") || "<li>Aucun historique.</li>"}</ul>
+  `;
+  openModal(
+    "Détail demande de document",
+    body,
+    `${request.content ? `<button class="primary" data-action="download-doc-request" data-id="${id}">Télécharger</button>` : `<button class="primary" data-action="generate-doc-request" data-id="${id}">Générer</button>`}<button class="ghost" data-action="close-modal">Fermer</button>`
+  );
+}
+
+function downloadDocumentRequest(id) {
+  const request = getDocumentRequest(id);
+  if (!request.content) generateDocumentRequest(id);
+  const refreshed = getDocumentRequest(id);
+  const employee = getEmployee(refreshed.employeeId);
+  const blob = new Blob([refreshed.content], { type: "text/plain;charset=utf-8" });
+  downloadBlob(blob, `${refreshed.type}_${employee.matricule}.txt`.replace(/\s+/g, "_").toLowerCase());
+  showToast("Document téléchargé.");
+}
+
+function transmitDocumentRequest(id) {
+  const request = getDocumentRequest(id);
+  const employee = getEmployee(request.employeeId);
+  if (!request.content) request.content = fillTemplate(state.data.documentTemplates[request.type] || state.data.documentTemplates.Autres, employee, request);
+  request.status = "Document transmis";
+  request.history = request.history || [];
+  request.history.push(`${formatDate(toISO(today()))} : document marqué transmis.`);
+  audit("Assistant RH", `${request.type} transmis pour ${fullName(employee)}.`);
+  showToast("Document marqué transmis.");
+  closeModal();
+  render();
+}
+
+function refuseDocumentRequest(id) {
+  const request = getDocumentRequest(id);
+  const employee = getEmployee(request.employeeId);
+  const reason = prompt("Motif du refus :", "") || "demande refusée.";
+  request.status = "Refusé";
+  request.history = request.history || [];
+  request.history.push(`${formatDate(toISO(today()))} : refus — ${reason}`);
+  audit("Assistant RH", `Demande de document refusée pour ${fullName(employee)}.`);
+  showToast("Demande refusée.");
+  render();
+}
+
 function transitionLeave(id, action) {
   const leave = state.data.leaveRequests.find((item) => item.id === id);
   const employee = getEmployee(leave.employeeId);
@@ -1290,6 +1722,8 @@ function saveEmployee() {
   const direction = document.getElementById("empDirection").value.trim();
   const agency = document.getElementById("empAgency").value.trim();
   const fonction = document.getElementById("empFonction").value.trim();
+  const leaveAvailable = Number(document.getElementById("empLeaveAvailable").value || 0);
+  const leaveTaken = Number(document.getElementById("empLeaveTaken").value || 0);
   if (!firstName || !lastName || !matricule || !service || !fonction) {
     showToast("Merci de renseigner les champs principaux.");
     return;
@@ -1299,17 +1733,25 @@ function saveEmployee() {
     matricule,
     firstName,
     lastName,
+    hireDate: document.getElementById("empHireDate").value,
+    birthDate: document.getElementById("empBirthDate").value,
+    phone: document.getElementById("empPhone").value.trim(),
+    email: document.getElementById("empEmail").value.trim(),
+    cnpsNumber: document.getElementById("empCnps").value.trim(),
     service,
     direction,
     agency,
     fonction,
-    status: "Actif",
+    maritalStatus: document.getElementById("empMaritalStatus").value.trim(),
+    childrenCount: Number(document.getElementById("empChildrenCount").value || 0),
+    departureDate: document.getElementById("empDepartureDate").value,
+    status: document.getElementById("empDepartureDate").value ? "Sorti" : "Actif",
     leaveBalance: {
-      initial: Number(document.getElementById("empLeaveAvailable").value || 0),
+      initial: leaveAvailable + leaveTaken,
       acquired: 0,
-      taken: 0,
+      taken: leaveTaken,
       planned: 0,
-      available: Number(document.getElementById("empLeaveAvailable").value || 0),
+      available: leaveAvailable,
     },
     contracts: [
       {
@@ -1350,6 +1792,31 @@ function saveSettings(event) {
   render();
 }
 
+function saveTemplate(event) {
+  event.preventDefault();
+  const type = document.getElementById("templateType").value;
+  const content = document.getElementById("templateContent").value;
+  state.data.documentTemplates[type] = content;
+  audit("Admin RH", `Modèle '${type}' mis à jour.`);
+  showToast("Modèle enregistré.");
+  render();
+}
+
+function updateTemplateEditor() {
+  const type = document.getElementById("templateType")?.value;
+  const textarea = document.getElementById("templateContent");
+  if (type && textarea) textarea.value = state.data.documentTemplates[type] || "";
+}
+
+function restoreTemplate() {
+  const type = document.getElementById("templateType")?.value;
+  if (!type) return;
+  state.data.documentTemplates[type] = DEFAULT_DOCUMENT_TEMPLATES[type] || "";
+  audit("Admin RH", `Modèle '${type}' remis par défaut.`);
+  showToast("Modèle par défaut restauré.");
+  render();
+}
+
 function parseNumberList(value) {
   return value.split(",").map((x) => Number(x.trim())).filter((x) => Number.isFinite(x)).sort((a, b) => b - a);
 }
@@ -1368,14 +1835,177 @@ async function login(event) {
     return;
   }
   state.authenticated = true;
+  state.employeePortal = { active: false, data: null };
   showToast("Connexion réussie.");
   await initApp();
+}
+
+async function employeeLogin(event) {
+  event.preventDefault();
+  if (!API_MODE) {
+    showToast("Le portail salarié doit être utilisé en ligne ou via le serveur.");
+    return;
+  }
+  const matricule = document.getElementById("employeeLoginMatricule").value.trim();
+  const response = await fetch("/api/employee/login", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ matricule }),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || !payload.ok) {
+    showToast("Matricule introuvable.");
+    return;
+  }
+  state.employeePortal = { active: true, data: payload.data };
+  showToast("Bienvenue dans ton espace salarié.");
+  renderEmployeePortal();
+}
+
+async function employeeLogout() {
+  await fetch("/api/employee/logout", { method: "POST", credentials: "same-origin" });
+  state.employeePortal = { active: false, data: null };
+  renderLogin();
+}
+
+function renderEmployeePortal() {
+  const portal = state.employeePortal.data;
+  if (!portal?.employee) {
+    renderLogin();
+    return;
+  }
+  document.getElementById("roleSelect").value = "Collaborateur";
+  const employee = portal.employee;
+  const balance = employee.leaveBalance || {};
+  const leaveRows = (portal.leaveRequests || []).map((leave) => `
+    <tr>
+      <td>${leave.type}</td>
+      <td>${formatDate(leave.start)} → ${formatDate(leave.end)}<br><span class="muted">Reprise : ${formatDate(leave.returnDate)}</span></td>
+      <td>${leave.days}</td>
+      <td>${statusTag(leave.status)}</td>
+      <td>${(leave.observations || []).slice(-1)[0] || "—"}</td>
+    </tr>
+  `).join("");
+  const docRows = (portal.documentRequests || []).map((request) => `
+    <tr>
+      <td>${request.type}</td>
+      <td>${formatDate(request.createdAt)}<br><span class="muted">${request.details || "—"}</span></td>
+      <td>${statusTag(request.status)}</td>
+      <td>${(request.history || []).slice(-1)[0] || "—"}</td>
+    </tr>
+  `).join("");
+
+  document.getElementById("pageTitle").textContent = "Espace salarié";
+  document.getElementById("appContent").innerHTML = `
+    <section class="panel">
+      <div class="panel-header">
+        <div>
+          <h3>Bienvenue ${fullName(employee)}</h3>
+          <p>Matricule Zeus : <strong>${employee.matricule}</strong>. Tu peux envoyer une demande et suivre son avancement.</p>
+        </div>
+        <button class="ghost" data-action="employee-logout">Déconnexion</button>
+      </div>
+      <div class="grid three">
+        ${kpiCard("Solde congé à date", `${balance.available ?? 0} j`, "Disponible")}
+        ${kpiCard("Congés déjà pris", `${balance.taken ?? 0} j`, "Historique RH")}
+        ${kpiCard("Demandes documents", (portal.documentRequests || []).length, "Total envoyé")}
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <div>
+          <h3>Demande de congé</h3>
+          <p>La demande part à RH puis à la Direction selon le circuit de validation.</p>
+        </div>
+      </div>
+      <form id="employeeLeaveForm" class="form-grid">
+        <label><span>Type de congé</span><select id="employeeLeaveType"><option>Congé annuel</option><option>Congé exceptionnel</option><option>Congé maladie</option><option>Congé maternité</option><option>Autre</option></select></label>
+        <label><span>Date de départ</span><input id="employeeLeaveStart" type="date" required></label>
+        <label><span>Date de fin</span><input id="employeeLeaveEnd" type="date" required></label>
+        <label class="full"><span>Motif / commentaire</span><textarea id="employeeLeaveComment"></textarea></label>
+        <div class="toolbar full"><button class="primary" type="submit">Envoyer ma demande de congé</button></div>
+      </form>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <div>
+          <h3>Demande de document</h3>
+          <p>Choisis le document souhaité. RH générera le document avec le modèle enregistré.</p>
+        </div>
+      </div>
+      <form id="employeeDocumentForm" class="form-grid">
+        <label><span>Document demandé</span><select id="employeeDocType">${DOCUMENT_TYPES.map((type) => `<option>${type}</option>`).join("")}</select></label>
+        <label class="full"><span>Précision</span><textarea id="employeeDocDetails" placeholder="Ex : bulletin de juillet, banque, autre document à préciser..."></textarea></label>
+        <div class="toolbar full"><button class="secondary" type="submit">Envoyer ma demande de document</button></div>
+      </form>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header"><div><h3>Suivi de mes congés</h3></div></div>
+      <div class="table-wrap">
+        <table><thead><tr><th>Type</th><th>Période</th><th>Jours</th><th>Statut</th><th>Observation</th></tr></thead><tbody>${leaveRows || `<tr><td colspan="5">Aucune demande de congé.</td></tr>`}</tbody></table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header"><div><h3>Suivi de mes documents</h3></div></div>
+      <div class="table-wrap">
+        <table><thead><tr><th>Document</th><th>Demande</th><th>Statut</th><th>Dernière étape</th></tr></thead><tbody>${docRows || `<tr><td colspan="4">Aucune demande de document.</td></tr>`}</tbody></table>
+      </div>
+    </section>
+  `;
+}
+
+async function submitEmployeeLeave(event) {
+  event.preventDefault();
+  const response = await apiFetch("/api/employee/leave", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      type: document.getElementById("employeeLeaveType").value,
+      start: document.getElementById("employeeLeaveStart").value,
+      end: document.getElementById("employeeLeaveEnd").value,
+      comment: document.getElementById("employeeLeaveComment").value,
+    }),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || !payload.ok) {
+    showToast(payload.error || "Demande impossible.");
+    return;
+  }
+  state.employeePortal.data = payload.data;
+  showToast("Demande de congé envoyée.");
+  renderEmployeePortal();
+}
+
+async function submitEmployeeDocument(event) {
+  event.preventDefault();
+  const response = await apiFetch("/api/employee/document-request", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      type: document.getElementById("employeeDocType").value,
+      details: document.getElementById("employeeDocDetails").value,
+    }),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || !payload.ok) {
+    showToast(payload.error || "Demande impossible.");
+    return;
+  }
+  state.employeePortal.data = payload.data;
+  showToast("Demande de document envoyée.");
+  renderEmployeePortal();
 }
 
 async function logout() {
   await fetch("/api/auth/logout", { method: "POST", credentials: "same-origin" });
   state.authenticated = false;
   state.apiReady = false;
+  state.employeePortal = { active: false, data: null };
   renderLogin();
 }
 
@@ -1429,7 +2059,7 @@ async function importDataFile(file) {
   }
   if (!confirm("Importer ce fichier va remplacer les données actuellement enregistrées. Continuer ?")) return;
   if (!API_MODE) {
-    state.data = data;
+    state.data = normalizeData(data);
     saveState();
     render();
     showToast("Données importées dans le navigateur.");
@@ -1445,9 +2075,46 @@ async function importDataFile(file) {
     showToast("Import impossible.");
     return;
   }
-  state.data = payload.data || data;
+  state.data = normalizeData(payload.data || data);
   render();
   showToast("Données importées dans la base.");
+}
+
+async function downloadEmployeeExcelTemplate() {
+  if (!API_MODE) {
+    showToast("Téléchargement disponible uniquement via le serveur.");
+    return;
+  }
+  const response = await apiFetch("/api/employees/template");
+  if (!response.ok) {
+    showToast("Modèle Excel impossible à générer.");
+    return;
+  }
+  const blob = await response.blob();
+  downloadBlob(blob, "modele_import_collaborateurs.xlsx");
+}
+
+async function importEmployeeExcel(file) {
+  if (!file) return;
+  if (!API_MODE) {
+    showToast("Import Excel disponible uniquement via le serveur.");
+    return;
+  }
+  const form = new FormData();
+  form.append("file", file);
+  const response = await apiFetch("/api/employees/import-excel", {
+    method: "POST",
+    body: form,
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || !payload.ok) {
+    showToast(payload.error || "Import Excel impossible.");
+    return;
+  }
+  state.data = normalizeData(payload.data || state.data);
+  closeModal();
+  showToast(`Import Excel terminé : ${payload.created} créé(s), ${payload.updated} mis à jour, ${payload.skipped} ignoré(s).`);
+  render();
 }
 
 function downloadTicket(id) {
@@ -1468,10 +2135,22 @@ function downloadTicket(id) {
 
 document.addEventListener("click", (event) => {
   const nav = event.target.closest("[data-view]");
-  if (nav) setView(nav.dataset.view);
+  if (nav) {
+    if (state.employeePortal.active) {
+      showToast("Tu es dans l’espace salarié. Déconnecte-toi pour revenir à l’administration RH.");
+      return;
+    }
+    setView(nav.dataset.view);
+  }
 
   const go = event.target.closest("[data-go]");
-  if (go) setView(go.dataset.go);
+  if (go) {
+    if (state.employeePortal.active) {
+      showToast("Action réservée à l’administration RH.");
+      return;
+    }
+    setView(go.dataset.go);
+  }
 
   const actionTarget = event.target.closest("[data-action]");
   if (!actionTarget) return;
@@ -1488,6 +2167,8 @@ document.addEventListener("click", (event) => {
     });
   }
   if (action === "add-employee") addEmployeeModal();
+  if (action === "import-excel-modal") importExcelModal();
+  if (action === "download-excel-template") downloadEmployeeExcelTemplate();
   if (action === "save-employee") saveEmployee();
   if (action === "renew-contract") renewContract(actionTarget.dataset.employee, actionTarget.dataset.contract);
   if (action === "save-renewal") saveRenewal();
@@ -1499,9 +2180,16 @@ document.addEventListener("click", (event) => {
   if (action === "leave-approve") transitionLeave(id, "approve");
   if (action === "view-ticket") viewTicket(id);
   if (action === "download-ticket") downloadTicket(id);
+  if (action === "doc-request-details") viewDocumentRequest(id);
+  if (action === "generate-doc-request") generateDocumentRequest(id);
+  if (action === "download-doc-request") downloadDocumentRequest(id);
+  if (action === "transmit-doc-request") transmitDocumentRequest(id);
+  if (action === "refuse-doc-request") refuseDocumentRequest(id);
+  if (action === "restore-template") restoreTemplate();
   if (action === "export-data") exportData();
   if (action === "backup-db") backupDatabase();
   if (action === "logout") logout();
+  if (action === "employee-logout") employeeLogout();
   if (action === "calendar-prev") {
     state.calendarMonth -= 1;
     if (state.calendarMonth < 0) {
@@ -1522,8 +2210,13 @@ document.addEventListener("click", (event) => {
 
 document.addEventListener("submit", (event) => {
   if (event.target.id === "loginForm") login(event);
+  if (event.target.id === "employeeLoginForm") employeeLogin(event);
+  if (event.target.id === "employeeLeaveForm") submitEmployeeLeave(event);
+  if (event.target.id === "employeeDocumentForm") submitEmployeeDocument(event);
   if (event.target.id === "leaveForm") createLeave(event);
+  if (event.target.id === "documentRequestForm") createDocumentRequest(event);
   if (event.target.id === "settingsForm") saveSettings(event);
+  if (event.target.id === "templateForm") saveTemplate(event);
 });
 
 document.addEventListener("input", (event) => {
@@ -1549,20 +2242,40 @@ document.addEventListener("change", (event) => {
     importDataFile(event.target.files?.[0]);
     event.target.value = "";
   }
+  if (event.target.id === "employeeExcelFile") {
+    importEmployeeExcel(event.target.files?.[0]);
+    event.target.value = "";
+  }
+  if (event.target.id === "templateType") {
+    updateTemplateEditor();
+  }
 });
 
 document.getElementById("roleSelect").addEventListener("change", (event) => {
+  if (state.employeePortal.active) {
+    event.target.value = "Collaborateur";
+    showToast("Rôle bloqué dans l’espace salarié.");
+    return;
+  }
   state.data.currentRole = event.target.value;
   showToast(`Rôle actif : ${event.target.value}`);
   render();
 });
 
 document.getElementById("globalSearch").addEventListener("input", (event) => {
+  if (state.employeePortal.active) {
+    event.target.value = "";
+    return;
+  }
   state.search = event.target.value;
   render();
 });
 
 document.getElementById("resetDemo").addEventListener("click", () => {
+  if (state.employeePortal.active) {
+    showToast("Réinitialisation réservée à l’administration RH.");
+    return;
+  }
   if (!confirm("Réinitialiser toutes les données de l'application ?")) return;
   localStorage.removeItem(STORAGE_KEY);
   state.data = defaultState();

@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 .DS_Store
+.neon/
+.neon
 
 # Base locale et sauvegardes : ne pas envoyer sur GitHub/Render
 application-rh/database/*.sqlite
