@@ -79,13 +79,14 @@ ROLE_PERMISSIONS = {
     "Admin RH": {
         "state_write", "import_json", "export_json", "backup", "excel_import", "excel_template",
         "leave_to_direction", "leave_modify", "leave_refuse", "leave_approve", "document_render",
+        "users_manage", "export_excel", "template_import",
     },
     "Assistant RH": {
         "state_write", "excel_import", "excel_template",
-        "leave_to_direction", "leave_modify", "leave_refuse", "document_render",
+        "leave_to_direction", "leave_modify", "leave_refuse", "document_render", "export_excel",
     },
     "Direction": {
-        "leave_refuse", "leave_approve", "document_render",
+        "leave_refuse", "leave_approve", "document_render", "export_excel",
     },
 }
 SMTP_HOST = os.environ.get("SMTP_HOST", "")
@@ -203,6 +204,10 @@ DEFAULT_SETTINGS = {
     "holidays": ["2026-01-01", "2026-04-06", "2026-05-01", "2026-08-07", "2026-12-25"],
     "allowExceptionalLeave": True,
     "ticketEnabled": True,
+    "notificationEmails": {
+        "rh": "",
+        "direction": "",
+    },
 }
 
 
@@ -216,6 +221,8 @@ def default_state() -> dict:
         "documents": [],
         "documentTemplates": dict(DEFAULT_DOCUMENT_TEMPLATES),
         "notifications": [],
+        "personnelActions": [],
+        "users": [],
         "auditLog": [],
     }
 
@@ -236,6 +243,10 @@ def normalize_state(value: Any) -> dict:
     incoming_settings = value.get("settings")
     if isinstance(incoming_settings, dict):
         settings.update(incoming_settings)
+        if isinstance(incoming_settings.get("notificationEmails"), dict):
+            emails = dict(DEFAULT_SETTINGS["notificationEmails"])
+            emails.update(incoming_settings.get("notificationEmails") or {})
+            settings["notificationEmails"] = emails
     state["settings"] = settings
 
     templates = dict(DEFAULT_DOCUMENT_TEMPLATES)
@@ -244,7 +255,7 @@ def normalize_state(value: Any) -> dict:
         templates.update({str(k): str(v) for k, v in incoming_templates.items()})
     state["documentTemplates"] = templates
 
-    for key in ["employees", "leaveRequests", "documentRequests", "documents", "notifications", "auditLog"]:
+    for key in ["employees", "leaveRequests", "documentRequests", "documents", "notifications", "personnelActions", "users", "auditLog"]:
         items = value.get(key)
         state[key] = items if isinstance(items, list) else []
 
@@ -635,6 +646,167 @@ def build_employee_template_workbook() -> bytes:
     return buffer.getvalue()
 
 
+def append_sheet(workbook: Workbook, title: str, headers: list[str], rows_data: list[list[Any]]) -> None:
+    sheet = workbook.create_sheet(title=title[:31])
+    sheet.append(headers)
+    for row in rows_data:
+        sheet.append(row)
+    for index, column in enumerate(headers, start=1):
+        sheet.cell(row=1, column=index).style = "Headline 3"
+        sheet.column_dimensions[sheet.cell(row=1, column=index).column_letter].width = max(16, min(34, len(column) + 5))
+
+
+def build_export_workbook(export_type: str = "summary") -> bytes:
+    if Workbook is None:
+        raise RuntimeError("La création Excel n'est pas disponible.")
+    data = get_state()
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+    export_type = str(export_type or "summary").lower()
+
+    employees = data.get("employees", [])
+    leaves = data.get("leaveRequests", [])
+    documents = data.get("documentRequests", [])
+    personnel_actions = data.get("personnelActions", [])
+
+    if export_type in {"summary", "all"}:
+        active = len([employee for employee in employees if employee.get("status") == "Actif"])
+        pending_leaves = len([leave for leave in leaves if leave.get("status") in {"Demande envoyée", "Modification demandée", "En attente de validation Direction"}])
+        pending_docs = len([request for request in documents if request.get("status") not in {"Document transmis", "Refusé"}])
+        expiring = 0
+        expired = 0
+        for employee in employees:
+            contract = (employee.get("contracts") or [{}])[-1]
+            end = contract.get("end")
+            if not end:
+                continue
+            try:
+                days = (datetime.strptime(end, "%Y-%m-%d").date() - datetime.now().date()).days
+            except ValueError:
+                continue
+            if days < 0:
+                expired += 1
+            elif days <= 90:
+                expiring += 1
+        append_sheet(workbook, "Synthèse", ["Indicateur", "Valeur"], [
+            ["Collaborateurs", len(employees)],
+            ["Collaborateurs actifs", active],
+            ["Contrats à échéance ≤ 90 jours", expiring],
+            ["Contrats expirés", expired],
+            ["Demandes de congé en attente", pending_leaves],
+            ["Demandes de document en attente", pending_docs],
+            ["Actions personnel", len(personnel_actions)],
+        ])
+
+    if export_type in {"employees", "all"}:
+        append_sheet(workbook, "Collaborateurs", [
+            "Matricule", "Nom", "Prénom", "Fonction", "Département", "Ville", "Téléphone", "Email",
+            "Type contrat", "Début contrat", "Fin contrat", "Salaire", "Solde congé disponible", "Statut",
+        ], [
+            [
+                employee.get("matricule", ""),
+                employee.get("lastName", ""),
+                employee.get("firstName", ""),
+                employee.get("fonction", ""),
+                employee.get("service", ""),
+                employee.get("agency", ""),
+                employee.get("phone", ""),
+                employee.get("email", ""),
+                ((employee.get("contracts") or [{}])[-1]).get("type", ""),
+                ((employee.get("contracts") or [{}])[-1]).get("start", ""),
+                ((employee.get("contracts") or [{}])[-1]).get("end", ""),
+                ((employee.get("contracts") or [{}])[-1]).get("salary", 0),
+                (employee.get("leaveBalance") or {}).get("available", 0),
+                employee.get("status", ""),
+            ]
+            for employee in employees
+        ])
+
+    if export_type in {"contracts", "all"}:
+        rows_data = []
+        for employee in employees:
+            for contract in employee.get("contracts", []):
+                rows_data.append([
+                    employee.get("matricule", ""),
+                    full_name_server(employee),
+                    contract.get("type", ""),
+                    contract.get("start", ""),
+                    contract.get("end", ""),
+                    contract.get("fonction", ""),
+                    contract.get("service", ""),
+                    contract.get("salary", 0),
+                    contract.get("status", ""),
+                    contract.get("renewalCount", 0),
+                ])
+        append_sheet(workbook, "Contrats", ["Matricule", "Collaborateur", "Type", "Début", "Fin", "Fonction", "Service", "Salaire", "Statut", "Renouvellements"], rows_data)
+
+    if export_type in {"leaves", "all"}:
+        append_sheet(workbook, "Congés", ["Matricule", "Collaborateur", "Type", "Début", "Fin", "Reprise", "Jours", "Statut", "Commentaire"], [
+            [
+                (find_employee_by_id(data, leave.get("employeeId", "")) or {}).get("matricule", ""),
+                full_name_server(find_employee_by_id(data, leave.get("employeeId", "")) or {}),
+                leave.get("type", ""),
+                leave.get("start", ""),
+                leave.get("end", ""),
+                leave.get("returnDate", ""),
+                leave.get("days", 0),
+                leave.get("status", ""),
+                leave.get("comment", ""),
+            ]
+            for leave in leaves
+        ])
+
+    if export_type in {"documents", "all"}:
+        append_sheet(workbook, "Documents", ["Matricule", "Collaborateur", "Document", "Date demande", "Statut", "Détail"], [
+            [
+                (find_employee_by_id(data, request.get("employeeId", "")) or {}).get("matricule", ""),
+                full_name_server(find_employee_by_id(data, request.get("employeeId", "")) or {}),
+                request.get("type", ""),
+                request.get("createdAt", ""),
+                request.get("status", ""),
+                request.get("details", ""),
+            ]
+            for request in documents
+        ])
+
+    if export_type in {"personnel", "all"}:
+        append_sheet(workbook, "Personnel", ["Matricule", "Collaborateur", "Type", "Date", "Objet", "Statut", "Détail"], [
+            [
+                (find_employee_by_id(data, action.get("employeeId", "")) or {}).get("matricule", ""),
+                full_name_server(find_employee_by_id(data, action.get("employeeId", "")) or {}),
+                action.get("type", ""),
+                action.get("date", ""),
+                action.get("title", ""),
+                action.get("status", ""),
+                action.get("details", ""),
+            ]
+            for action in personnel_actions
+        ])
+
+    if not workbook.sheetnames:
+        append_sheet(workbook, "Synthèse", ["Indicateur", "Valeur"], [["Aucune donnée", 0]])
+
+    buffer = BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue()
+
+
+def import_docx_template(content: bytes) -> str:
+    if Document is None:
+        raise RuntimeError("La lecture Word n'est pas disponible. Vérifiez la dépendance python-docx.")
+    document = Document(BytesIO(content))
+    lines = [paragraph.text for paragraph in document.paragraphs if paragraph.text.strip()]
+    for table in document.tables:
+        for row in table.rows:
+            values = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+            if values:
+                lines.append(" | ".join(values))
+    text = "\n".join(lines).strip()
+    if not text:
+        raise RuntimeError("Le modèle Word ne contient pas de texte lisible.")
+    return text
+
+
 def extract_multipart_file(body: bytes, content_type: str) -> bytes:
     marker = "boundary="
     if marker not in content_type:
@@ -783,6 +955,15 @@ def record_notification(data: dict, event_type: str, subject: str, body: str, re
     return item
 
 
+def notification_recipients(data: dict, target: str) -> list[str]:
+    emails = ((data.get("settings") or {}).get("notificationEmails") or {})
+    if target == "rh":
+        return [emails.get("rh") or NOTIFY_RH_EMAIL]
+    if target == "direction":
+        return [emails.get("direction") or NOTIFY_DIRECTION_EMAIL]
+    return []
+
+
 def notify_employee_if_possible(data: dict, employee: dict, subject: str, body: str, event_type: str) -> None:
     record_notification(data, event_type, subject, body, [employee.get("email", "")])
 
@@ -816,7 +997,7 @@ def transition_leave_server(data: dict, leave_id: str, action: str, role: str, o
             "Congés",
             "Demande de congé à valider",
             f"{name} attend une validation Direction pour {leave.get('days', 0)} jour(s), du {format_date_fr(leave.get('start', ''))} au {format_date_fr(leave.get('end', ''))}.",
-            [NOTIFY_DIRECTION_EMAIL],
+            notification_recipients(data, "direction"),
         )
     elif action == "modify":
         leave["status"] = "Modification demandée"
@@ -880,7 +1061,14 @@ def render_document_file(title: str, content: str, file_format: str) -> tuple[by
         if Document is None:
             raise RuntimeError("La génération Word n'est pas disponible. Vérifiez la dépendance python-docx.")
         document = Document()
+        section = document.sections[0]
+        header = section.header
+        header_para = header.paragraphs[0]
+        header_para.text = "PALLADIUM AFRIQUE · RH CONTROL"
+        header_para.alignment = 1
         document.add_heading(title, level=1)
+        document.add_paragraph(f"Date d'édition : {format_date_fr(today_iso())}")
+        document.add_paragraph("")
         for block in content.split("\n\n"):
             lines = [line for line in block.splitlines()]
             if not lines:
@@ -891,6 +1079,9 @@ def render_document_file(title: str, content: str, file_format: str) -> tuple[by
                     if index:
                         paragraph.add_run().add_break()
                     paragraph.add_run(line)
+        document.add_paragraph("")
+        document.add_paragraph("Fait pour servir et valoir ce que de droit.")
+        document.add_paragraph("Signature et cachet :")
         buffer = BytesIO()
         document.save(buffer)
         return (
@@ -904,11 +1095,22 @@ def render_document_file(title: str, content: str, file_format: str) -> tuple[by
         buffer = BytesIO()
         pdf = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=48, leftMargin=48, topMargin=54, bottomMargin=48)
         styles = getSampleStyleSheet()
-        story = [Paragraph(xml_escape(title), styles["Title"]), Spacer(1, 18)]
+        story = [
+            Paragraph("PALLADIUM AFRIQUE · RH CONTROL", styles["Heading3"]),
+            Spacer(1, 8),
+            Paragraph(xml_escape(title), styles["Title"]),
+            Paragraph(f"Date d'édition : {format_date_fr(today_iso())}", styles["BodyText"]),
+            Spacer(1, 18),
+        ]
         for block in content.split("\n\n"):
             html = "<br/>".join(xml_escape(line) for line in block.splitlines()) or "&nbsp;"
             story.append(Paragraph(html, styles["BodyText"]))
             story.append(Spacer(1, 9))
+        story.extend([
+            Spacer(1, 18),
+            Paragraph("Fait pour servir et valoir ce que de droit.", styles["BodyText"]),
+            Paragraph("Signature et cachet :", styles["BodyText"]),
+        ])
         pdf.build(story)
         return buffer.getvalue(), safe_filename(title, "pdf"), "application/pdf"
     raise RuntimeError("Format non reconnu. Utilise docx ou pdf.")
@@ -916,21 +1118,176 @@ def render_document_file(title: str, content: str, file_format: str) -> tuple[by
 
 def sanitize_state_for_role(incoming: dict, role: str) -> dict:
     state = normalize_state(incoming)
+    current = get_state()
+    current_users_by_id = {user.get("id"): user for user in current.get("users", [])}
+    for user in state.get("users", []):
+        current_user = current_users_by_id.get(user.get("id"))
+        if current_user and current_user.get("passwordHash") and not user.get("passwordHash"):
+            user["passwordHash"] = current_user.get("passwordHash")
     if normalize_role(role) == "Admin RH":
         return state
-    current = get_state()
     state["settings"] = current.get("settings", dict(DEFAULT_SETTINGS))
     state["documentTemplates"] = current.get("documentTemplates", dict(DEFAULT_DOCUMENT_TEMPLATES))
+    state["users"] = current.get("users", [])
     state["currentRole"] = current.get("currentRole", "Admin RH")
     return state
+
+
+def hash_password(password: str) -> str:
+    iterations = 260000
+    salt = os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return "pbkdf2_sha256${}${}${}".format(
+        iterations,
+        base64.urlsafe_b64encode(salt).decode("ascii"),
+        base64.urlsafe_b64encode(digest).decode("ascii"),
+    )
+
+
+def verify_password_hash(password: str, password_hash: str) -> bool:
+    try:
+        algorithm, iterations, salt_b64, digest_b64 = str(password_hash or "").split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        salt = base64.urlsafe_b64decode(salt_b64.encode("ascii"))
+        expected = base64.urlsafe_b64decode(digest_b64.encode("ascii"))
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, int(iterations))
+        return hmac.compare_digest(actual, expected)
+    except Exception:
+        return False
+
+
+def public_user(user: dict) -> dict:
+    return {
+        "id": user.get("id", ""),
+        "username": user.get("username", ""),
+        "fullName": user.get("fullName", ""),
+        "role": normalize_role(user.get("role")),
+        "active": user.get("active", True) is not False,
+        "createdAt": user.get("createdAt", ""),
+        "updatedAt": user.get("updatedAt", ""),
+        "lastLoginAt": user.get("lastLoginAt", ""),
+        "hasPassword": bool(user.get("passwordHash")),
+    }
+
+
+def state_for_client(data: dict) -> dict:
+    public_state = normalize_state(data)
+    public_state["users"] = [public_user(user) for user in data.get("users", [])]
+    return public_state
+
+
+def upsert_user(data: dict, payload: dict, actor: str) -> dict:
+    users = data.setdefault("users", [])
+    user_id = str(payload.get("id", "")).strip()
+    username = str(payload.get("username", "")).strip()
+    if not username:
+        raise RuntimeError("Identifiant utilisateur obligatoire.")
+    role = normalize_role(payload.get("role"))
+    password = str(payload.get("password", ""))
+    now = datetime.now().isoformat(timespec="seconds")
+    existing = next((user for user in users if user.get("id") == user_id), None) if user_id else None
+    if not existing:
+        for user in users:
+            if normalize_lookup(user.get("username")) == normalize_lookup(username):
+                raise RuntimeError("Cet identifiant existe déjà.")
+        existing = {
+            "id": f"user-{uuid.uuid4().hex[:12]}",
+            "createdAt": now,
+            "passwordHash": "",
+        }
+        users.append(existing)
+    elif normalize_lookup(existing.get("username")) != normalize_lookup(username):
+        for user in users:
+            if user.get("id") != existing.get("id") and normalize_lookup(user.get("username")) == normalize_lookup(username):
+                raise RuntimeError("Cet identifiant existe déjà.")
+
+    if not existing.get("passwordHash") and not password:
+        raise RuntimeError("Mot de passe obligatoire pour un nouvel utilisateur.")
+
+    existing.update({
+        "username": username,
+        "fullName": str(payload.get("fullName", "")).strip() or username,
+        "role": role,
+        "active": payload.get("active", True) is not False,
+        "updatedAt": now,
+    })
+    if password:
+        if len(password) < 8:
+            raise RuntimeError("Le mot de passe doit contenir au moins 8 caractères.")
+        existing["passwordHash"] = hash_password(password)
+
+    data.setdefault("auditLog", []).insert(0, {
+        "date": today_iso(),
+        "actor": actor,
+        "action": f"Compte utilisateur '{username}' enregistré avec le rôle {role}.",
+    })
+    return existing
+
+
+def role_default_username(role: str) -> str:
+    return {
+        "Admin RH": "admin",
+        "Assistant RH": "assistant",
+        "Direction": "direction",
+    }.get(normalize_role(role), "admin")
+
+
+def find_login_user(data: dict, username: str, role: str) -> dict | None:
+    username_key = normalize_lookup(username)
+    role = normalize_role(role)
+    for user in data.get("users", []):
+        if user.get("active", True) is False:
+            continue
+        user_role = normalize_role(user.get("role"))
+        user_key = normalize_lookup(user.get("username"))
+        role_alias = normalize_lookup(role_default_username(user_role))
+        role_key = normalize_lookup(user_role)
+        if username_key and username_key in {user_key, role_alias, role_key} and (not role or user_role == role):
+            return user
+    return None
+
+
+def authenticate_admin_login(username: str, role: str, password: str) -> tuple[str | None, dict | None]:
+    role = normalize_role(role)
+    data = get_state()
+    username = str(username or "").strip()
+    user = find_login_user(data, username or role_default_username(role), role)
+    if user and verify_password_hash(password, user.get("passwordHash", "")):
+        user["lastLoginAt"] = datetime.now().isoformat(timespec="seconds")
+        save_state(data)
+        return normalize_role(user.get("role")), public_user(user)
+    if user:
+        return None, None
+
+    if authenticate_role(role, password):
+        return role, {
+            "id": f"env-{normalize_lookup(role)}",
+            "username": role_default_username(role),
+            "fullName": role,
+            "role": role,
+            "active": True,
+            "source": "Render",
+        }
+    return None, None
 
 
 def configured_role_passwords() -> dict[str, str]:
     return {role: password for role, password in ROLE_PASSWORDS.items() if password}
 
 
+def stored_user_auth_enabled() -> bool:
+    try:
+        return any(
+            user.get("active", True) is not False and user.get("passwordHash")
+            for user in get_state().get("users", [])
+        )
+    except Exception:
+        return False
+
+
 def auth_required() -> bool:
-    return bool(configured_role_passwords())
+    return bool(configured_role_passwords()) or stored_user_auth_enabled()
 
 
 def normalize_role(role: str | None) -> str:
@@ -941,7 +1298,7 @@ def normalize_role(role: str | None) -> str:
 def authenticate_role(role: str, password: str) -> bool:
     passwords = configured_role_passwords()
     if not passwords:
-        return True
+        return not stored_user_auth_enabled()
     role = normalize_role(role)
     expected = passwords.get(role)
     if not expected:
@@ -1230,6 +1587,8 @@ def get_state() -> dict:
             "documents": documents,
             "documentTemplates": dict(DEFAULT_DOCUMENT_TEMPLATES),
             "notifications": [],
+            "personnelActions": [],
+            "users": [],
             "auditLog": audit_log,
         }
 
@@ -1521,7 +1880,17 @@ class Handler(SimpleHTTPRequestHandler):
                 "durable": db_is_durable(),
                 "role": self.current_admin_role(),
                 "emailConfigured": bool(SMTP_HOST and SMTP_FROM),
-                "data": get_state(),
+                "data": state_for_client(get_state()),
+            })
+            return
+        if path == "/api/users":
+            if not self.require_permission("users_manage"):
+                return
+            data = get_state()
+            self.send_json({
+                "ok": True,
+                "users": [public_user(user) for user in data.get("users", [])],
+                "fallbackRoles": list(configured_role_passwords().keys()),
             })
             return
         if path == "/api/export":
@@ -1529,6 +1898,25 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             self.send_json_download(f"rh_control_export_{stamp}.json", get_state())
+            return
+        if path == "/api/export-excel":
+            if not self.require_permission("export_excel"):
+                return
+            query = urlparse(self.path).query
+            export_type = "summary"
+            for part in query.split("&"):
+                if part.startswith("type="):
+                    export_type = part.split("=", 1)[1]
+            try:
+                body = build_export_workbook(export_type)
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                self.send_binary_download(
+                    f"rapport_rh_{export_type}_{stamp}.xlsx",
+                    body,
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=500)
             return
         if path == "/api/employees/template":
             if not self.require_permission("excel_template"):
@@ -1558,10 +1946,12 @@ class Handler(SimpleHTTPRequestHandler):
             payload = self.read_json()
             password = payload.get("password", "")
             role = normalize_role(payload.get("role", "Admin RH"))
-            if authenticate_role(role, password):
+            username = str(payload.get("username", "")).strip()
+            authenticated_role, user = authenticate_admin_login(username, role, password)
+            if authenticated_role:
                 self.send_json(
-                    {"ok": True, "authRequired": auth_required(), "role": role},
-                    extra_headers={"Set-Cookie": create_session_cookie(role)},
+                    {"ok": True, "authRequired": auth_required(), "role": authenticated_role, "user": user},
+                    extra_headers={"Set-Cookie": create_session_cookie(authenticated_role)},
                 )
                 return
             self.send_json({"ok": False, "error": "Mot de passe incorrect"}, status=401)
@@ -1634,7 +2024,7 @@ class Handler(SimpleHTTPRequestHandler):
                 "Congés",
                 "Nouvelle demande de congé",
                 f"{full_name_server(employee)} a demandé {days} jour(s), du {format_date_fr(start)} au {format_date_fr(end)}.",
-                [NOTIFY_RH_EMAIL],
+                notification_recipients(data, "rh"),
             )
             save_state(data)
             refreshed = get_state()
@@ -1670,7 +2060,7 @@ class Handler(SimpleHTTPRequestHandler):
                 "Documents",
                 "Nouvelle demande de document RH",
                 f"{full_name_server(employee)} a demandé : {request_type}. Précision : {details or '—'}.",
-                [NOTIFY_RH_EMAIL],
+                notification_recipients(data, "rh"),
             )
             save_state(data)
             refreshed = get_state()
@@ -1693,7 +2083,7 @@ class Handler(SimpleHTTPRequestHandler):
                     str(payload.get("observation", "")).strip(),
                 )
                 save_state(data)
-                self.send_json({"ok": True, "data": get_state()})
+                self.send_json({"ok": True, "data": state_for_client(get_state())})
             except PermissionError as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=403)
             except Exception as exc:
@@ -1712,6 +2102,32 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_binary_download(filename, body, content_type)
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=500)
+            return
+        if path == "/api/templates/import-docx":
+            if not self.require_permission("template_import"):
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length)
+                content = extract_multipart_file(body, self.headers.get("Content-Type", ""))
+                text = import_docx_template(content)
+                self.send_json({"ok": True, "content": text})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=500)
+            return
+        if path == "/api/users":
+            role = self.require_permission("users_manage")
+            if not role:
+                return
+            try:
+                payload = self.read_json()
+                data = get_state()
+                upsert_user(data, payload, role)
+                save_state(data)
+                refreshed = get_state()
+                self.send_json({"ok": True, "users": [public_user(user) for user in refreshed.get("users", [])]})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
             return
         if path == "/api/employees/preview-excel":
             if not self.require_permission("excel_import"):
@@ -1734,6 +2150,7 @@ class Handler(SimpleHTTPRequestHandler):
                 body = self.rfile.read(length)
                 content = extract_multipart_file(body, self.headers.get("Content-Type", ""))
                 result = import_employees_from_excel(content, actor=role)
+                result["data"] = state_for_client(result.get("data", get_state()))
                 self.send_json({"ok": True, **result})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=500)
@@ -1769,7 +2186,7 @@ class Handler(SimpleHTTPRequestHandler):
                 payload = self.read_json()
                 data = payload.get("data", payload)
                 save_state(data)
-                self.send_json({"ok": True, "database": database_label(), "data": get_state()})
+                self.send_json({"ok": True, "database": database_label(), "data": state_for_client(get_state())})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=500)
             return

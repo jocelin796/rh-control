@@ -7,6 +7,7 @@ let lastExcelPreview = null;
 const viewTitles = {
   dashboard: "Tableau de bord",
   employees: "Collaborateurs",
+  personnel: "Administration du personnel",
   contracts: "Contrats",
   leaves: "Congés",
   documents: "Documents RH",
@@ -20,12 +21,12 @@ const viewTitles = {
 const ROLE_CONFIG = {
   "Admin RH": {
     defaultView: "dashboard",
-    views: ["dashboard", "alerts", "employees", "contracts", "leaves", "documents", "calendar", "returns", "settings", "history"],
+    views: ["dashboard", "alerts", "employees", "personnel", "contracts", "leaves", "documents", "calendar", "returns", "settings", "history"],
     help: "Accès complet : administration, import Excel, paramétrage, validations et historique.",
   },
   "Assistant RH": {
     defaultView: "dashboard",
-    views: ["dashboard", "alerts", "employees", "contracts", "leaves", "documents", "calendar", "returns", "history"],
+    views: ["dashboard", "alerts", "employees", "personnel", "contracts", "leaves", "documents", "calendar", "returns", "history"],
     help: "Gestion opérationnelle RH : collaborateurs, contrats, congés, documents et alertes. Paramétrage réservé à l’Admin.",
   },
   "Direction": {
@@ -43,8 +44,10 @@ const ROLE_CONFIG = {
 const ACTION_ROLES = {
   "add-employee": ["Admin RH", "Assistant RH"],
   "save-employee": ["Admin RH", "Assistant RH"],
+  "save-personnel-action": ["Admin RH", "Assistant RH"],
   "import-excel-modal": ["Admin RH", "Assistant RH"],
   "download-excel-template": ["Admin RH", "Assistant RH"],
+  "export-excel": ["Admin RH", "Assistant RH", "Direction"],
   "new-leave-for": ["Admin RH", "Assistant RH"],
   "create-leave": ["Admin RH", "Assistant RH"],
   "create-document-request": ["Admin RH", "Assistant RH"],
@@ -61,6 +64,9 @@ const ACTION_ROLES = {
   "refuse-doc-request": ["Admin RH", "Assistant RH"],
   "confirm-excel-import": ["Admin RH", "Assistant RH"],
   "download-import-report": ["Admin RH", "Assistant RH"],
+  "save-user-account": ["Admin RH"],
+  "edit-user-account": ["Admin RH"],
+  "import-docx-template": ["Admin RH"],
   "restore-template": ["Admin RH"],
   "export-data": ["Admin RH"],
   "import-data": ["Admin RH"],
@@ -153,6 +159,7 @@ const state = {
   authRequired: false,
   authenticated: false,
   serverRole: "",
+  currentUser: null,
   emailConfigured: false,
   durableDatabase: false,
   databasePath: "",
@@ -177,6 +184,8 @@ function defaultState() {
     documents: [],
     documentTemplates: { ...DEFAULT_DOCUMENT_TEMPLATES },
     notifications: [],
+    personnelActions: [],
+    users: [],
     auditLog: [],
   };
 }
@@ -196,6 +205,8 @@ function normalizeData(data) {
     documents: Array.isArray(incoming.documents) ? incoming.documents : [],
     documentTemplates: templates,
     notifications: Array.isArray(incoming.notifications) ? incoming.notifications : [],
+    personnelActions: Array.isArray(incoming.personnelActions) ? incoming.personnelActions : [],
+    users: Array.isArray(incoming.users) ? incoming.users : [],
     auditLog: Array.isArray(incoming.auditLog) ? incoming.auditLog : [],
   };
 }
@@ -363,6 +374,10 @@ function renderLogin() {
           <form id="loginForm" class="secure-login-form">
             <label>
               <span>IDENTIFIANT</span>
+              <input id="loginUsername" autocomplete="username" value="admin" placeholder="admin">
+            </label>
+            <label>
+              <span>RÔLE</span>
               <select id="loginRole" autocomplete="username">
                 <option>Admin RH</option>
                 <option>Assistant RH</option>
@@ -666,6 +681,7 @@ function metrics() {
     docsToProcess:
       state.data.documents.filter((doc) => doc.status !== "Document transmis").length
       + state.data.documentRequests.filter((doc) => !["Document transmis", "Refusé"].includes(doc.status)).length,
+    personnelActions: state.data.personnelActions.length,
     alerts: generateAlerts().length,
   };
 }
@@ -742,6 +758,14 @@ function canWriteWholeState(role = currentRole()) {
   return !API_MODE || ["Admin RH", "Assistant RH"].includes(role);
 }
 
+function defaultUsernameForRole(role) {
+  return {
+    "Admin RH": "admin",
+    "Assistant RH": "assistant",
+    Direction: "direction",
+  }[role] || "admin";
+}
+
 function firstAllowedView(role = currentRole()) {
   return roleConfig(role).defaultView || roleConfig(role).views[0] || "dashboard";
 }
@@ -801,6 +825,7 @@ function render() {
   const renderers = {
     dashboard: renderDashboard,
     employees: renderEmployees,
+    personnel: renderPersonnel,
     contracts: renderContracts,
     leaves: renderLeaves,
     documents: renderDocuments,
@@ -853,6 +878,8 @@ function renderDashboard() {
   const quickActions = [
     canDo("import-excel-modal") ? `<button class="action-card" data-action="import-excel-modal"><strong>📥 Importer Excel</strong><span>Créer ou mettre à jour par matricule Zeus</span></button>` : "",
     canDo("add-employee") ? `<button class="action-card" data-action="add-employee"><strong>👤 Ajouter un salarié</strong><span>Saisie manuelle d’une fiche complète</span></button>` : "",
+    canView("personnel") ? `<button class="action-card" data-go="personnel"><strong>🧩 Administration personnel</strong><span>Formations, affectations, promotions, sanctions</span></button>` : "",
+    canDo("export-excel") ? `<button class="action-card" data-action="export-excel" data-type="summary"><strong>📊 Export synthèse Excel</strong><span>Rapport global prêt à partager</span></button>` : "",
     canView("documents") ? `<button class="action-card" data-go="documents"><strong>🗂️ Documents RH</strong><span>Demandes, modèles et génération</span></button>` : "",
     canView("alerts") ? `<button class="action-card" data-go="alerts"><strong>🔔 Voir les alertes</strong><span>Contrats, congés, reprises, documents</span></button>` : "",
   ].filter(Boolean).join("");
@@ -898,10 +925,11 @@ function renderDashboard() {
       ${kpiCard("Alertes RH", m.alerts, "Actions nécessitant attention")}
     </div>
 
-    <div class="grid three">
+    <div class="grid four">
       ${kpiCard("CDD", m.cdd, "Contrats à durée déterminée")}
       ${kpiCard("CDI", m.cdi, "Contrats à durée indéterminée")}
       ${kpiCard("Reprises cette semaine", m.returnsWeek, `${m.returnsToday} reprise(s) aujourd'hui`)}
+      ${kpiCard("Actions personnel", m.personnelActions, "Formations, affectations, notes RH")}
     </div>
 
     <section class="panel">
@@ -1079,6 +1107,7 @@ function renderEmployees() {
           <p>Contrat, service, fonction, solde de congés et accès rapide à la demande.</p>
         </div>
         <div class="toolbar">
+          ${canDo("export-excel") ? `<button class="ghost" data-action="export-excel" data-type="employees">Exporter Excel</button>` : ""}
           ${canDo("download-excel-template") ? `<button class="ghost" data-action="download-excel-template">Télécharger modèle Excel</button>` : ""}
           ${canDo("import-excel-modal") ? `<button class="secondary" data-action="import-excel-modal">Importer Excel</button>` : ""}
           ${canDo("add-employee") ? `<button class="primary" data-action="add-employee">Ajouter un collaborateur</button>` : ""}
@@ -1096,6 +1125,77 @@ function renderEmployees() {
             <tr><th>Collaborateur</th><th>Matricule</th><th>Service / Agence</th><th>Contrat</th><th>Statut</th><th>Solde congés</th><th>Actions</th></tr>
           </thead>
           <tbody>${rows || `<tr><td colspan="7">Aucun collaborateur trouvé.</td></tr>`}</tbody>
+        </table>
+      </div>
+    </section>
+  `;
+}
+
+function renderPersonnel() {
+  const hasEmployees = state.data.employees.length > 0;
+  const employeeOptions = hasEmployees
+    ? state.data.employees
+      .map((employee) => `<option value="${employee.id}">${fullName(employee)} — ${employee.matricule}</option>`)
+      .join("")
+    : `<option value="">Aucun collaborateur enregistré</option>`;
+  const actions = state.data.personnelActions
+    .filter((item) => {
+      const employee = getEmployee(item.employeeId);
+      return filterText(`${item.type} ${item.title} ${item.status} ${employee ? fullName(employee) : ""}`);
+    })
+    .sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")))
+    .map((item) => {
+      const employee = getEmployee(item.employeeId);
+      return `
+        <tr>
+          <td><strong>${employee ? fullName(employee) : "Collaborateur"}</strong><br><span class="muted">${employee?.matricule || "—"}</span></td>
+          <td>${tag(item.type || "Action", item.status === "Clôturé" ? "green" : "blue")}</td>
+          <td>${formatDate(item.date)}</td>
+          <td><strong>${escapeHtml(item.title || "—")}</strong><br><span class="muted">${escapeHtml(item.details || "—")}</span></td>
+          <td>${statusTag(item.status || "Ouvert")}</td>
+        </tr>
+      `;
+    }).join("");
+
+  return `
+    ${canDo("save-personnel-action") ? `<section class="panel">
+      <div class="panel-header">
+        <div>
+          <h3>Nouvelle action personnel</h3>
+          <p>Suivi des événements RH qui complètent la fiche collaborateur.</p>
+        </div>
+      </div>
+      <form id="personnelActionForm" class="form-grid">
+        <label><span>Collaborateur</span><select id="personnelEmployee" ${hasEmployees ? "" : "disabled"}>${employeeOptions}</select></label>
+        <label><span>Type</span><select id="personnelType">
+          <option>Période d’essai</option>
+          <option>Formation</option>
+          <option>Affectation</option>
+          <option>Promotion</option>
+          <option>Avertissement</option>
+          <option>Sanction</option>
+          <option>Note RH</option>
+        </select></label>
+        <label><span>Date</span><input id="personnelDate" type="date" value="${toISO(today())}"></label>
+        <label><span>Statut</span><select id="personnelStatus"><option>Ouvert</option><option>En cours</option><option>Clôturé</option></select></label>
+        <label class="full"><span>Objet</span><input id="personnelTitle" placeholder="Ex : formation sécurité, promotion, changement d’affectation..." required></label>
+        <label class="full"><span>Détail</span><textarea id="personnelDetails" placeholder="Note interne, décision, prochaine étape..."></textarea></label>
+        <div class="toolbar full"><button class="primary" type="submit" ${hasEmployees ? "" : "disabled"}>Enregistrer l’action</button></div>
+      </form>
+    </section>` : ""}
+
+    <section class="panel">
+      <div class="panel-header">
+        <div>
+          <h3>Administration du personnel</h3>
+          <p>Formations, affectations, promotions, sanctions et événements importants.</p>
+        </div>
+        ${canDo("export-excel") ? `<button class="ghost" data-action="export-excel" data-type="personnel">Exporter Excel</button>` : ""}
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Collaborateur</th><th>Type</th><th>Date</th><th>Objet</th><th>Statut</th></tr></thead>
+          <tbody>${actions || `<tr><td colspan="5">Aucune action personnel enregistrée.</td></tr>`}</tbody>
         </table>
       </div>
     </section>
@@ -1149,7 +1249,10 @@ function renderContracts() {
           <h3>Tableau de suivi des contrats</h3>
           <p>Surveillance automatique des échéances selon les seuils paramétrés.</p>
         </div>
-        <button class="ghost" data-go="settings">Modifier les seuils</button>
+        <div class="toolbar">
+          ${canDo("export-excel") ? `<button class="ghost" data-action="export-excel" data-type="contracts">Exporter Excel</button>` : ""}
+          <button class="ghost" data-go="settings">Modifier les seuils</button>
+        </div>
       </div>
       <div class="hint">Seuils actuels : ${state.data.settings.contractAlertDays.join(", ")} jours avant échéance.</div>
       <div class="toolbar">
@@ -1244,6 +1347,7 @@ function renderLeaves() {
           <h3>Demandes de congés</h3>
           <p>Rôle actif : <strong>${currentRole()}</strong>. Les boutons de validation changent selon ce rôle.</p>
         </div>
+        ${canDo("export-excel") ? `<button class="ghost" data-action="export-excel" data-type="leaves">Exporter Excel</button>` : ""}
       </div>
       <div class="table-wrap">
         <table>
@@ -1337,7 +1441,10 @@ function renderDocuments() {
           <h3>Demandes de documents</h3>
           <p>Les modèles enregistrés dans Paramétrage remplissent automatiquement les informations du salarié.</p>
         </div>
-        <button class="ghost" data-go="settings">Gérer les modèles</button>
+        <div class="toolbar">
+          ${canDo("export-excel") ? `<button class="ghost" data-action="export-excel" data-type="documents">Exporter Excel</button>` : ""}
+          <button class="ghost" data-go="settings">Gérer les modèles</button>
+        </div>
       </div>
       <div class="hint">Astuce : clique sur <strong>Générer</strong> pour produire le contenu à partir du modèle, puis <strong>Télécharger</strong> ou <strong>Transmis</strong> selon le traitement.</div>
       <br>
@@ -1487,6 +1594,16 @@ function renderAlerts() {
 
 function renderSettings() {
   const s = state.data.settings;
+  const notificationEmails = s.notificationEmails || {};
+  const userRows = (state.data.users || []).map((user) => `
+    <tr>
+      <td><strong>${escapeHtml(user.username || "—")}</strong><br><span class="muted">${escapeHtml(user.fullName || "")}</span></td>
+      <td>${tag(user.role || "—", user.active === false ? "gray" : "blue")}</td>
+      <td>${user.active === false ? statusTag("Inactif") : statusTag("Actif")}</td>
+      <td>${user.lastLoginAt ? new Date(user.lastLoginAt).toLocaleString("fr-FR") : "—"}</td>
+      <td class="mini-actions"><button data-action="edit-user-account" data-id="${user.id}">Modifier</button></td>
+    </tr>
+  `).join("");
   const days = [
     ["1", "Lundi"],
     ["2", "Mardi"],
@@ -1527,6 +1644,8 @@ function renderSettings() {
             <option value="false" ${!s.ticketEnabled ? "selected" : ""}>Désactivée</option>
           </select>
         </label>
+        <label><span>E-mail RH destinataire</span><input id="notifyRhEmail" type="email" value="${escapeHtml(notificationEmails.rh || "")}" placeholder="rh@entreprise.com"></label>
+        <label><span>E-mail Direction destinataire</span><input id="notifyDirectionEmail" type="email" value="${escapeHtml(notificationEmails.direction || "")}" placeholder="direction@entreprise.com"></label>
         <div class="toolbar full">
           <button class="primary" type="submit">Enregistrer le paramétrage</button>
         </div>
@@ -1552,9 +1671,31 @@ function renderSettings() {
         </div>
         <div class="toolbar full">
           <button class="primary" type="submit">Enregistrer le modèle</button>
+          <label class="secondary">
+            Importer un modèle Word
+            <input id="docxTemplateFile" type="file" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" hidden>
+          </label>
           <button class="ghost" type="button" data-action="restore-template">Remettre le modèle par défaut</button>
         </div>
       </form>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <div>
+          <h3>Gestion des utilisateurs</h3>
+          <p>Créer les comptes internes avec identifiant, rôle, statut et mot de passe.</p>
+        </div>
+        <button class="primary" data-action="edit-user-account">Ajouter un utilisateur</button>
+      </div>
+      <div class="hint">Les mots de passe ne sont jamais affichés. Si aucun compte n’est créé, les mots de passe Render actuels restent utilisables.</div>
+      <br>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Utilisateur</th><th>Rôle</th><th>Statut</th><th>Dernière connexion</th><th>Actions</th></tr></thead>
+          <tbody>${userRows || `<tr><td colspan="5">Aucun utilisateur créé dans l’application pour le moment.</td></tr>`}</tbody>
+        </table>
+      </div>
     </section>
   `;
 }
@@ -1892,6 +2033,33 @@ function createDocumentRequest(event) {
   render();
 }
 
+function savePersonnelAction(event) {
+  event.preventDefault();
+  const employee = getEmployee(document.getElementById("personnelEmployee").value);
+  if (!employee) {
+    showToast("Ajoute d’abord un collaborateur réel.");
+    return;
+  }
+  const action = {
+    id: `pers-${Date.now()}`,
+    employeeId: employee.id,
+    type: document.getElementById("personnelType").value,
+    date: document.getElementById("personnelDate").value || toISO(today()),
+    title: document.getElementById("personnelTitle").value.trim(),
+    details: document.getElementById("personnelDetails").value.trim(),
+    status: document.getElementById("personnelStatus").value,
+    createdAt: toISO(today()),
+  };
+  if (!action.title) {
+    showToast("Indique l’objet de l’action personnel.");
+    return;
+  }
+  state.data.personnelActions.unshift(action);
+  audit(currentRole(), `${action.type} enregistré pour ${fullName(employee)}.`);
+  showToast("Action personnel enregistrée.");
+  render();
+}
+
 function templateVariables(employee, request = {}) {
   const contract = getCurrentContract(employee);
   const balance = employee.leaveBalance || {};
@@ -2185,6 +2353,10 @@ function saveSettings(event) {
   state.data.settings.holidays = document.getElementById("holidays").value.split(/\n|,/).map((x) => x.trim()).filter(Boolean);
   state.data.settings.allowExceptionalLeave = document.getElementById("allowExceptionalLeave").value === "true";
   state.data.settings.ticketEnabled = document.getElementById("ticketEnabled").value === "true";
+  state.data.settings.notificationEmails = {
+    rh: document.getElementById("notifyRhEmail")?.value?.trim() || "",
+    direction: document.getElementById("notifyDirectionEmail")?.value?.trim() || "",
+  };
   audit("Admin RH", "Paramétrage des alertes et règles de congés mis à jour.");
   showToast("Paramétrage enregistré.");
   render();
@@ -2215,6 +2387,80 @@ function restoreTemplate() {
   render();
 }
 
+function userAccountModal(id = "") {
+  const user = (state.data.users || []).find((item) => item.id === id) || {};
+  openModal(
+    id ? "Modifier l’utilisateur" : "Ajouter un utilisateur",
+    `
+      <form id="userAccountForm" class="form-grid">
+        <input type="hidden" id="userAccountId" value="${escapeHtml(user.id || "")}">
+        <label><span>Identifiant</span><input id="userAccountUsername" value="${escapeHtml(user.username || "")}" placeholder="ex : admin, assistant1" required></label>
+        <label><span>Nom affiché</span><input id="userAccountFullName" value="${escapeHtml(user.fullName || "")}" placeholder="Nom et prénom"></label>
+        <label><span>Rôle</span><select id="userAccountRole">
+          ${["Admin RH", "Assistant RH", "Direction"].map((role) => `<option ${user.role === role ? "selected" : ""}>${role}</option>`).join("")}
+        </select></label>
+        <label><span>Statut</span><select id="userAccountActive">
+          <option value="true" ${user.active === false ? "" : "selected"}>Actif</option>
+          <option value="false" ${user.active === false ? "selected" : ""}>Inactif</option>
+        </select></label>
+        <label class="full"><span>${id ? "Nouveau mot de passe (laisser vide pour ne pas changer)" : "Mot de passe"}</span><input id="userAccountPassword" type="password" autocomplete="new-password" ${id ? "" : "required"}></label>
+      </form>
+    `,
+    `<button class="primary" data-action="save-user-account">Enregistrer</button><button class="ghost" data-action="close-modal">Fermer</button>`
+  );
+}
+
+async function saveUserAccount() {
+  const payload = {
+    id: document.getElementById("userAccountId").value,
+    username: document.getElementById("userAccountUsername").value.trim(),
+    fullName: document.getElementById("userAccountFullName").value.trim(),
+    role: document.getElementById("userAccountRole").value,
+    active: document.getElementById("userAccountActive").value === "true",
+    password: document.getElementById("userAccountPassword").value,
+  };
+  if (!payload.username) {
+    showToast("Identifiant obligatoire.");
+    return;
+  }
+  const response = await apiFetch("/api/users", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok || !result.ok) {
+    showToast(result.error || "Utilisateur impossible à enregistrer.");
+    return;
+  }
+  state.data.users = result.users || [];
+  closeModal();
+  showToast("Utilisateur enregistré.");
+  render();
+}
+
+async function importDocxTemplate(file) {
+  if (!file) return;
+  if (!API_MODE) {
+    showToast("Import Word disponible uniquement via le serveur.");
+    return;
+  }
+  const form = new FormData();
+  form.append("file", file);
+  const response = await apiFetch("/api/templates/import-docx", {
+    method: "POST",
+    body: form,
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || !payload.ok) {
+    showToast(payload.error || "Modèle Word impossible à lire.");
+    return;
+  }
+  const textarea = document.getElementById("templateContent");
+  if (textarea) textarea.value = payload.content;
+  showToast("Modèle Word importé. Vérifie puis clique sur Enregistrer le modèle.");
+}
+
 function parseNumberList(value) {
   return value.split(",").map((x) => Number(x.trim())).filter((x) => Number.isFinite(x)).sort((a, b) => b - a);
 }
@@ -2223,11 +2469,12 @@ async function login(event) {
   event.preventDefault();
   const password = document.getElementById("loginPassword").value;
   const role = document.getElementById("loginRole").value;
+  const username = document.getElementById("loginUsername")?.value?.trim() || "";
   const response = await fetch("/api/auth/login", {
     method: "POST",
     credentials: "same-origin",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ password, role }),
+    body: JSON.stringify({ username, password, role }),
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
@@ -2235,6 +2482,7 @@ async function login(event) {
     return;
   }
   state.serverRole = payload.role || role;
+  state.currentUser = payload.user || null;
   state.data.currentRole = state.serverRole;
   state.authenticated = true;
   state.employeePortal = { active: false, data: null };
@@ -2409,6 +2657,7 @@ async function logout() {
   state.authenticated = false;
   state.apiReady = false;
   state.serverRole = "";
+  state.currentUser = null;
   state.employeePortal = { active: false, data: null };
   renderLogin();
 }
@@ -2426,6 +2675,20 @@ async function exportData() {
   }
   const blob = await response.blob();
   downloadBlob(blob, `rh_control_export_${Date.now()}.json`);
+}
+
+async function exportExcel(type = "summary") {
+  if (!API_MODE) {
+    showToast("Export Excel disponible uniquement via le serveur.");
+    return;
+  }
+  const response = await apiFetch(`/api/export-excel?type=${encodeURIComponent(type)}`);
+  if (!response.ok) {
+    showToast("Export Excel impossible.");
+    return;
+  }
+  const blob = await response.blob();
+  downloadBlob(blob, `rapport_rh_${type}_${Date.now()}.xlsx`);
 }
 
 async function backupDatabase() {
@@ -2676,6 +2939,7 @@ document.addEventListener("click", (event) => {
   if (action === "add-employee") addEmployeeModal();
   if (action === "import-excel-modal") importExcelModal();
   if (action === "download-excel-template") downloadEmployeeExcelTemplate();
+  if (action === "export-excel") exportExcel(actionTarget.dataset.type || "summary");
   if (action === "save-employee") saveEmployee();
   if (action === "renew-contract") renewContract(actionTarget.dataset.employee, actionTarget.dataset.contract);
   if (action === "save-renewal") saveRenewal();
@@ -2695,9 +2959,14 @@ document.addEventListener("click", (event) => {
   if (action === "confirm-excel-import") confirmEmployeeExcelImport();
   if (action === "download-import-report") downloadExcelPreviewReport();
   if (action === "restore-template") restoreTemplate();
+  if (action === "edit-user-account") userAccountModal(id);
+  if (action === "save-user-account") saveUserAccount();
   if (action === "export-data") exportData();
   if (action === "backup-db") backupDatabase();
-  if (action === "logout") logout();
+  if (action === "logout") {
+    if (state.employeePortal.active) employeeLogout();
+    else logout();
+  }
   if (action === "employee-logout") employeeLogout();
   if (action === "calendar-prev") {
     state.calendarMonth -= 1;
@@ -2738,6 +3007,14 @@ document.addEventListener("submit", (event) => {
     }
     createDocumentRequest(event);
   }
+  if (event.target.id === "personnelActionForm") {
+    if (!canDo("save-personnel-action")) {
+      event.preventDefault();
+      showToast(`Action personnel non autorisée pour le rôle : ${currentRole()}.`);
+      return;
+    }
+    savePersonnelAction(event);
+  }
   if (event.target.id === "settingsForm") {
     if (currentRole() !== "Admin RH") {
       event.preventDefault();
@@ -2775,6 +3052,10 @@ document.addEventListener("change", (event) => {
     state.calendarFilter.service = event.target.value;
     render();
   }
+  if (event.target.id === "loginRole") {
+    const username = document.getElementById("loginUsername");
+    if (username) username.value = defaultUsernameForRole(event.target.value);
+  }
   if (event.target.id === "importDataFile") {
     if (!canDo("import-data")) {
       showToast("Import JSON réservé à l’Admin RH.");
@@ -2791,6 +3072,15 @@ document.addEventListener("change", (event) => {
       return;
     }
     importEmployeeExcel(event.target.files?.[0]);
+    event.target.value = "";
+  }
+  if (event.target.id === "docxTemplateFile") {
+    if (!canDo("import-docx-template")) {
+      showToast("Import de modèle Word réservé à l’Admin RH.");
+      event.target.value = "";
+      return;
+    }
+    importDocxTemplate(event.target.files?.[0]);
     event.target.value = "";
   }
   if (event.target.id === "templateType") {

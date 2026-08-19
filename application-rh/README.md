@@ -110,13 +110,18 @@ Il est toujours possible d’ouvrir `index.html` directement, mais dans ce mode 
 
 - Tableau de bord RH avec indicateurs clés.
 - Tableau de bord décisionnel : groupes à risque, groupes stables, attentes RH et Direction.
+- Bouton `Se déconnecter` visible après connexion.
 - Fiches collaborateurs avec contrat et solde de congés.
+- Administration du personnel : période d’essai, formation, affectation, promotion, avertissement, sanction et note RH.
 - Import Excel des collaborateurs par matricule Zeus avec aperçu, erreurs et rapport CSV avant validation.
 - Portail salarié : connexion par matricule, demande de congé et suivi.
 - Demande de documents RH : attestation de travail, domiciliation de salaire, bulletin, fiche de congé, attestation de départ en congé annuel, certificat de travail et autres demandes.
 - Modèles de documents paramétrables avec remplissage automatique.
 - Téléchargement des documents générés en Word `.docx` ou PDF `.pdf`.
+- Import d’un modèle Word `.docx` pour alimenter un modèle de document RH.
 - Journal interne des notifications et préparation SMTP pour envoi e-mail réel.
+- Gestion des utilisateurs internes : identifiant, rôle, statut et mot de passe.
+- Exports Excel professionnels : synthèse, collaborateurs, contrats, congés, documents et personnel.
 - Suivi des contrats avec alertes d’échéance.
 - Renouvellement de contrat avec conservation de l’historique.
 - Formulaire de demande de congé.
