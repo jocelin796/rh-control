@@ -15,6 +15,52 @@ const viewTitles = {
   history: "Historique",
 };
 
+const ROLE_CONFIG = {
+  "Admin RH": {
+    defaultView: "dashboard",
+    views: ["dashboard", "alerts", "employees", "contracts", "leaves", "documents", "calendar", "returns", "settings", "history"],
+    help: "Accès complet : administration, import Excel, paramétrage, validations et historique.",
+  },
+  "Assistant RH": {
+    defaultView: "dashboard",
+    views: ["dashboard", "alerts", "employees", "contracts", "leaves", "documents", "calendar", "returns", "history"],
+    help: "Gestion opérationnelle RH : collaborateurs, contrats, congés, documents et alertes. Paramétrage réservé à l’Admin.",
+  },
+  "Direction": {
+    defaultView: "dashboard",
+    views: ["dashboard", "alerts", "leaves", "documents", "calendar", "history"],
+    help: "Validation et supervision : congés, documents, alertes et calendrier.",
+  },
+  "Collaborateur": {
+    defaultView: "dashboard",
+    views: ["dashboard"],
+    help: "Le collaborateur utilise l’espace salarié avec son matricule Zeus pour voir uniquement ses demandes.",
+  },
+};
+
+const ACTION_ROLES = {
+  "add-employee": ["Admin RH", "Assistant RH"],
+  "save-employee": ["Admin RH", "Assistant RH"],
+  "import-excel-modal": ["Admin RH", "Assistant RH"],
+  "download-excel-template": ["Admin RH", "Assistant RH"],
+  "new-leave-for": ["Admin RH", "Assistant RH"],
+  "create-leave": ["Admin RH", "Assistant RH"],
+  "create-document-request": ["Admin RH", "Assistant RH"],
+  "renew-contract": ["Admin RH", "Assistant RH"],
+  "save-renewal": ["Admin RH", "Assistant RH"],
+  "leave-to-direction": ["Admin RH", "Assistant RH"],
+  "leave-modify": ["Admin RH", "Assistant RH"],
+  "leave-approve": ["Admin RH", "Direction"],
+  "leave-refuse": ["Admin RH", "Assistant RH", "Direction"],
+  "generate-doc-request": ["Admin RH", "Assistant RH"],
+  "transmit-doc-request": ["Admin RH", "Assistant RH"],
+  "refuse-doc-request": ["Admin RH", "Assistant RH"],
+  "restore-template": ["Admin RH"],
+  "export-data": ["Admin RH"],
+  "import-data": ["Admin RH"],
+  "backup-db": ["Admin RH"],
+};
+
 const DOCUMENT_TYPES = [
   "Attestation de travail",
   "Domiciliation de salaire",
@@ -574,16 +620,68 @@ function metrics() {
   };
 }
 
-function setView(view) {
-  state.view = view;
+function currentRole() {
+  return state.data.currentRole || "Admin RH";
+}
+
+function roleConfig(role = currentRole()) {
+  return ROLE_CONFIG[role] || ROLE_CONFIG["Admin RH"];
+}
+
+function canView(view, role = currentRole()) {
+  return roleConfig(role).views.includes(view);
+}
+
+function canDo(action, role = currentRole()) {
+  const allowedRoles = ACTION_ROLES[action];
+  return !allowedRoles || allowedRoles.includes(role);
+}
+
+function firstAllowedView(role = currentRole()) {
+  return roleConfig(role).defaultView || roleConfig(role).views[0] || "dashboard";
+}
+
+function enforceAllowedView(showMessage = false) {
+  if (!canView(state.view)) {
+    state.view = firstAllowedView();
+    if (showMessage) showToast(`Vue réservée. Affichage adapté au rôle : ${currentRole()}.`);
+  }
+}
+
+function updateRoleVisibility() {
+  const role = currentRole();
   document.querySelectorAll(".nav-link").forEach((btn) => {
-    btn.classList.toggle("active", btn.dataset.view === view);
+    const allowed = canView(btn.dataset.view, role);
+    btn.hidden = !allowed;
+    btn.classList.toggle("active", allowed && btn.dataset.view === state.view);
   });
+  document.querySelectorAll(".nav-section").forEach((section) => {
+    let hasVisibleItem = false;
+    let node = section.nextElementSibling;
+    while (node && !node.classList.contains("nav-section")) {
+      if (node.classList.contains("nav-link") && !node.hidden) hasVisibleItem = true;
+      node = node.nextElementSibling;
+    }
+    section.hidden = !hasVisibleItem;
+  });
+  const roleHelp = document.getElementById("roleHelp");
+  if (roleHelp) roleHelp.textContent = roleConfig(role).help;
+  const resetButton = document.getElementById("resetDemo");
+  if (resetButton) resetButton.hidden = role !== "Admin RH";
+}
+
+function setView(view) {
+  if (!canView(view)) {
+    showToast(`Cette vue n’est pas disponible pour le rôle : ${currentRole()}.`);
+    view = firstAllowedView();
+  }
+  state.view = view;
   document.getElementById("pageTitle").textContent = viewTitles[view];
   render();
 }
 
 function render() {
+  enforceAllowedView();
   const content = document.getElementById("appContent");
   const renderers = {
     dashboard: renderDashboard,
@@ -599,6 +697,7 @@ function render() {
   };
   content.innerHTML = renderers[state.view]();
   document.getElementById("roleSelect").value = state.data.currentRole;
+  updateRoleVisibility();
   saveState();
 }
 
@@ -613,9 +712,33 @@ function kpiCard(label, value, help, color = "") {
 }
 
 function renderDashboard() {
+  if (currentRole() === "Collaborateur") {
+    return `
+      <section class="panel">
+        <div class="panel-header">
+          <div>
+            <h3>👤 Espace collaborateur</h3>
+            <p>Pour protéger les données RH, un collaborateur ne voit pas le back-office. Il doit utiliser son matricule Zeus sur l’écran de connexion.</p>
+          </div>
+          <button class="secondary" data-action="logout">Aller à la connexion salarié</button>
+        </div>
+        <div class="step-list">
+          <div class="step"><strong>1. Se déconnecter</strong><span>Retour à l’écran de connexion.</span></div>
+          <div class="step"><strong>2. Entrer le matricule Zeus</strong><span>Connexion à l’espace personnel.</span></div>
+          <div class="step"><strong>3. Faire ses demandes</strong><span>Congés, documents et suivi d’avancement.</span></div>
+        </div>
+      </section>
+    `;
+  }
   const m = metrics();
   const alerts = generateAlerts().slice(0, 6);
   const recent = state.data.auditLog.slice(0, 5);
+  const quickActions = [
+    canDo("import-excel-modal") ? `<button class="action-card" data-action="import-excel-modal"><strong>📥 Importer Excel</strong><span>Créer ou mettre à jour par matricule Zeus</span></button>` : "",
+    canDo("add-employee") ? `<button class="action-card" data-action="add-employee"><strong>👤 Ajouter un salarié</strong><span>Saisie manuelle d’une fiche complète</span></button>` : "",
+    canView("documents") ? `<button class="action-card" data-go="documents"><strong>🗂️ Documents RH</strong><span>Demandes, modèles et génération</span></button>` : "",
+    canView("alerts") ? `<button class="action-card" data-go="alerts"><strong>🔔 Voir les alertes</strong><span>Contrats, congés, reprises, documents</span></button>` : "",
+  ].filter(Boolean).join("");
   return `
     <div class="${API_MODE && state.apiReady && state.durableDatabase ? "success" : "warning"} status-banner">
       <span>${API_MODE && state.apiReady
@@ -632,10 +755,7 @@ function renderDashboard() {
         </div>
       </div>
       <div class="quick-actions">
-        <button class="action-card" data-action="import-excel-modal"><strong>📥 Importer Excel</strong><span>Créer ou mettre à jour par matricule Zeus</span></button>
-        <button class="action-card" data-action="add-employee"><strong>👤 Ajouter un salarié</strong><span>Saisie manuelle d’une fiche complète</span></button>
-        <button class="action-card" data-go="documents"><strong>🗂️ Documents RH</strong><span>Demandes, modèles et génération</span></button>
-        <button class="action-card" data-go="alerts"><strong>🔔 Voir les alertes</strong><span>Contrats, congés, reprises, documents</span></button>
+        ${quickActions || `<div class="empty-state">Aucune action rapide pour ce rôle.</div>`}
       </div>
     </section>
 
@@ -646,10 +766,10 @@ function renderDashboard() {
             <h3>Base RH vide</h3>
             <p>Aucune donnée fictive n’est chargée. Ajoute les collaborateurs réels pour commencer le suivi des contrats et congés.</p>
           </div>
-          <div class="toolbar">
-            <button class="secondary" data-action="import-excel-modal">Importer depuis Excel</button>
-            <button class="primary" data-action="add-employee">Ajouter manuellement</button>
-          </div>
+          ${canDo("import-excel-modal") || canDo("add-employee") ? `<div class="toolbar">
+            ${canDo("import-excel-modal") ? `<button class="secondary" data-action="import-excel-modal">Importer depuis Excel</button>` : ""}
+            ${canDo("add-employee") ? `<button class="primary" data-action="add-employee">Ajouter manuellement</button>` : ""}
+          </div>` : ""}
         </div>
       </section>
     ` : ""}
@@ -744,7 +864,7 @@ function renderEmployees() {
           </td>
           <td class="mini-actions">
             <button data-action="employee-file" data-id="${employee.id}">Fiche</button>
-            <button data-action="new-leave-for" data-id="${employee.id}">Congé</button>
+            ${canDo("new-leave-for") ? `<button data-action="new-leave-for" data-id="${employee.id}">Congé</button>` : ""}
           </td>
         </tr>
       `;
@@ -759,17 +879,17 @@ function renderEmployees() {
           <p>Contrat, service, fonction, solde de congés et accès rapide à la demande.</p>
         </div>
         <div class="toolbar">
-          <button class="ghost" data-action="download-excel-template">Télécharger modèle Excel</button>
-          <button class="secondary" data-action="import-excel-modal">Importer Excel</button>
-          <button class="primary" data-action="add-employee">Ajouter un collaborateur</button>
+          ${canDo("download-excel-template") ? `<button class="ghost" data-action="download-excel-template">Télécharger modèle Excel</button>` : ""}
+          ${canDo("import-excel-modal") ? `<button class="secondary" data-action="import-excel-modal">Importer Excel</button>` : ""}
+          ${canDo("add-employee") ? `<button class="primary" data-action="add-employee">Ajouter un collaborateur</button>` : ""}
         </div>
       </div>
-      <div class="step-list">
+      ${canDo("import-excel-modal") ? `<div class="step-list">
         <div class="step"><strong>1. Télécharger</strong><span>Récupère le modèle Excel avec les bonnes colonnes.</span></div>
         <div class="step"><strong>2. Remplir</strong><span>Le matricule Zeus sert de clé unique pour chaque salarié.</span></div>
         <div class="step"><strong>3. Importer</strong><span>Les fiches existantes sont mises à jour automatiquement.</span></div>
       </div>
-      <br>
+      <br>` : ""}
       <div class="table-wrap">
         <table>
           <thead>
@@ -814,7 +934,7 @@ function renderContracts() {
           <td>${money(contract.salary)}</td>
           <td>${statusTag(status)}</td>
           <td class="mini-actions">
-            <button data-action="renew-contract" data-employee="${employee.id}" data-contract="${contract.id}">Renouveler</button>
+            ${canDo("renew-contract") ? `<button data-action="renew-contract" data-employee="${employee.id}" data-contract="${contract.id}">Renouveler</button>` : ""}
             <button data-action="contract-history" data-employee="${employee.id}">Historique</button>
           </td>
         </tr>
@@ -894,7 +1014,7 @@ function renderLeaves() {
     .join("");
 
   return `
-    <section class="panel">
+    ${canDo("create-leave") ? `<section class="panel">
       <div class="panel-header">
         <div>
           <h3>Nouvelle demande de congé</h3>
@@ -916,7 +1036,7 @@ function renderLeaves() {
         </div>
         ${hasEmployees ? "" : `<div class="warning full">Ajoute d’abord un collaborateur réel avant de créer une demande de congé.</div>`}
       </form>
-    </section>
+    </section>` : ""}
 
     <section class="panel">
       <div class="panel-header">
@@ -991,7 +1111,7 @@ function renderDocuments() {
     .join("");
 
   return `
-    <section class="panel">
+    ${canDo("create-document-request") ? `<section class="panel">
       <div class="panel-header">
         <div>
           <h3>Nouvelle demande de document</h3>
@@ -1009,7 +1129,7 @@ function renderDocuments() {
       <div class="columns-list">
         ${DOCUMENT_TYPES.map((type) => `<span class="tag blue">${type}</span>`).join("")}
       </div>
-    </section>
+    </section>` : ""}
 
     <section class="panel">
       <div class="panel-header">
@@ -1033,10 +1153,10 @@ function renderDocuments() {
 
 function documentRequestActions(request) {
   const actions = [`<button data-action="doc-request-details" data-id="${request.id}">Détails</button>`];
-  if (!request.content) actions.push(`<button data-action="generate-doc-request" data-id="${request.id}">Générer</button>`);
+  if (!request.content && canDo("generate-doc-request")) actions.push(`<button data-action="generate-doc-request" data-id="${request.id}">Générer</button>`);
   if (request.content) actions.push(`<button data-action="download-doc-request" data-id="${request.id}">Télécharger</button>`);
-  if (request.status !== "Document transmis") actions.push(`<button data-action="transmit-doc-request" data-id="${request.id}">Transmis</button>`);
-  if (!["Document transmis", "Refusé"].includes(request.status)) actions.push(`<button data-action="refuse-doc-request" data-id="${request.id}">Refuser</button>`);
+  if (request.status !== "Document transmis" && canDo("transmit-doc-request")) actions.push(`<button data-action="transmit-doc-request" data-id="${request.id}">Transmis</button>`);
+  if (!["Document transmis", "Refusé"].includes(request.status) && canDo("refuse-doc-request")) actions.push(`<button data-action="refuse-doc-request" data-id="${request.id}">Refuser</button>`);
   return actions.join("");
 }
 
@@ -2188,6 +2308,10 @@ document.addEventListener("click", (event) => {
   if (!actionTarget) return;
   const action = actionTarget.dataset.action;
   const id = actionTarget.dataset.id;
+  if (!canDo(action)) {
+    showToast(`Action non autorisée pour le rôle : ${currentRole()}.`);
+    return;
+  }
 
   if (action === "close-modal") closeModal();
   if (action === "employee-file") employeeFile(id);
@@ -2245,10 +2369,38 @@ document.addEventListener("submit", (event) => {
   if (event.target.id === "employeeLoginForm") employeeLogin(event);
   if (event.target.id === "employeeLeaveForm") submitEmployeeLeave(event);
   if (event.target.id === "employeeDocumentForm") submitEmployeeDocument(event);
-  if (event.target.id === "leaveForm") createLeave(event);
-  if (event.target.id === "documentRequestForm") createDocumentRequest(event);
-  if (event.target.id === "settingsForm") saveSettings(event);
-  if (event.target.id === "templateForm") saveTemplate(event);
+  if (event.target.id === "leaveForm") {
+    if (!canDo("create-leave")) {
+      event.preventDefault();
+      showToast(`Création de congé non autorisée pour le rôle : ${currentRole()}.`);
+      return;
+    }
+    createLeave(event);
+  }
+  if (event.target.id === "documentRequestForm") {
+    if (!canDo("create-document-request")) {
+      event.preventDefault();
+      showToast(`Création de document non autorisée pour le rôle : ${currentRole()}.`);
+      return;
+    }
+    createDocumentRequest(event);
+  }
+  if (event.target.id === "settingsForm") {
+    if (currentRole() !== "Admin RH") {
+      event.preventDefault();
+      showToast("Paramétrage réservé à l’Admin RH.");
+      return;
+    }
+    saveSettings(event);
+  }
+  if (event.target.id === "templateForm") {
+    if (currentRole() !== "Admin RH") {
+      event.preventDefault();
+      showToast("Modèles réservés à l’Admin RH.");
+      return;
+    }
+    saveTemplate(event);
+  }
 });
 
 document.addEventListener("input", (event) => {
@@ -2271,10 +2423,20 @@ document.addEventListener("change", (event) => {
     render();
   }
   if (event.target.id === "importDataFile") {
+    if (!canDo("import-data")) {
+      showToast("Import JSON réservé à l’Admin RH.");
+      event.target.value = "";
+      return;
+    }
     importDataFile(event.target.files?.[0]);
     event.target.value = "";
   }
   if (event.target.id === "employeeExcelFile") {
+    if (!canDo("import-excel-modal")) {
+      showToast(`Import Excel non autorisé pour le rôle : ${currentRole()}.`);
+      event.target.value = "";
+      return;
+    }
     importEmployeeExcel(event.target.files?.[0]);
     event.target.value = "";
   }
@@ -2290,6 +2452,9 @@ document.getElementById("roleSelect").addEventListener("change", (event) => {
     return;
   }
   state.data.currentRole = event.target.value;
+  if (!canView(state.view, event.target.value)) {
+    state.view = firstAllowedView(event.target.value);
+  }
   showToast(`Rôle actif : ${event.target.value}`);
   render();
 });
@@ -2306,6 +2471,10 @@ document.getElementById("globalSearch").addEventListener("input", (event) => {
 document.getElementById("resetDemo").addEventListener("click", () => {
   if (state.employeePortal.active) {
     showToast("Réinitialisation réservée à l’administration RH.");
+    return;
+  }
+  if (currentRole() !== "Admin RH") {
+    showToast("Réinitialisation réservée à l’Admin RH.");
     return;
   }
   if (!confirm("Réinitialiser toutes les données de l'application ?")) return;
