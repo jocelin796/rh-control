@@ -18,16 +18,19 @@
         </div>
 
         <nav class="nav" aria-label="Navigation principale">
-          <button class="nav-link active" data-view="dashboard">Tableau de bord</button>
-          <button class="nav-link" data-view="employees">Collaborateurs</button>
-          <button class="nav-link" data-view="contracts">Contrats</button>
-          <button class="nav-link" data-view="leaves">Congés</button>
-          <button class="nav-link" data-view="documents">Documents</button>
-          <button class="nav-link" data-view="calendar">Calendrier</button>
-          <button class="nav-link" data-view="returns">Reprises</button>
-          <button class="nav-link" data-view="alerts">Alertes RH</button>
-          <button class="nav-link" data-view="settings">Paramétrage</button>
-          <button class="nav-link" data-view="history">Historique</button>
+          <span class="nav-section">Pilotage</span>
+          <button class="nav-link active" data-view="dashboard"><span>📊</span> Tableau de bord</button>
+          <button class="nav-link" data-view="alerts"><span>🔔</span> Alertes RH</button>
+          <span class="nav-section">Gestion RH</span>
+          <button class="nav-link" data-view="employees"><span>👥</span> Collaborateurs</button>
+          <button class="nav-link" data-view="contracts"><span>📄</span> Contrats</button>
+          <button class="nav-link" data-view="leaves"><span>🌴</span> Congés</button>
+          <button class="nav-link" data-view="documents"><span>🗂️</span> Documents</button>
+          <button class="nav-link" data-view="calendar"><span>🗓️</span> Calendrier</button>
+          <button class="nav-link" data-view="returns"><span>↩️</span> Reprises</button>
+          <span class="nav-section">Administration</span>
+          <button class="nav-link" data-view="settings"><span>⚙️</span> Paramétrage</button>
+          <button class="nav-link" data-view="history"><span>🧾</span> Historique</button>
         </nav>
 
         <div class="sidebar-card">
@@ -38,7 +41,7 @@
             <option value="Direction">Direction</option>
             <option value="Admin RH">Admin RH</option>
           </select>
-          <p>Les actions visibles changent selon le rôle sélectionné.</p>
+          <p>Choisis le rôle avant de valider les congés ou traiter les documents.</p>
         </div>
       </aside>
 
@@ -50,7 +53,7 @@
           </div>
           <div class="topbar-actions">
             <input id="globalSearch" type="search" placeholder="Rechercher un nom, matricule, service..." />
-            <button class="ghost" id="resetDemo">Réinitialiser</button>
+            <button class="danger-soft" id="resetDemo">Réinitialiser</button>
           </div>
         </header>
 

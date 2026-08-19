@@ -250,40 +250,42 @@ async function initApp() {
 function renderLogin() {
   document.getElementById("pageTitle").textContent = "Connexion RH";
   document.getElementById("appContent").innerHTML = `
-    <section class="panel">
-      <div class="panel-header">
-        <div>
-          <h3>Connexion sécurisée</h3>
-          <p>Entre le mot de passe administrateur pour accéder aux données RH.</p>
+    <div class="login-choice-grid">
+      <section class="panel">
+        <div class="panel-header">
+          <div>
+            <h3>🔐 Administration RH</h3>
+            <p>Accès complet : import Excel, contrats, validations, documents et paramétrage.</p>
+          </div>
         </div>
-      </div>
-      <form id="loginForm" class="form-grid">
-        <label class="full">
-          <span>Mot de passe</span>
-          <input id="loginPassword" type="password" autocomplete="current-password" required autofocus>
-        </label>
-        <div class="toolbar full">
-          <button class="primary" type="submit">Se connecter</button>
+        <form id="loginForm" class="form-grid">
+          <label class="full">
+            <span>Mot de passe administrateur</span>
+            <input id="loginPassword" type="password" autocomplete="current-password" required autofocus>
+          </label>
+          <div class="toolbar full">
+            <button class="primary" type="submit">Ouvrir l’administration</button>
+          </div>
+        </form>
+      </section>
+      <section class="panel">
+        <div class="panel-header">
+          <div>
+            <h3>👤 Espace salarié</h3>
+            <p>Connexion simple par matricule Zeus pour demander congés/documents et suivre l’avancement.</p>
+          </div>
         </div>
-      </form>
-    </section>
-    <section class="panel">
-      <div class="panel-header">
-        <div>
-          <h3>Espace salarié</h3>
-          <p>Chaque collaborateur se connecte avec son matricule Zeus pour faire ses demandes et suivre l’avancement.</p>
-        </div>
-      </div>
-      <form id="employeeLoginForm" class="form-grid">
-        <label class="full">
-          <span>Matricule Zeus</span>
-          <input id="employeeLoginMatricule" placeholder="Exemple : ZEUS001" autocomplete="username" required>
-        </label>
-        <div class="toolbar full">
-          <button class="secondary" type="submit">Entrer dans mon espace</button>
-        </div>
-      </form>
-    </section>
+        <form id="employeeLoginForm" class="form-grid">
+          <label class="full">
+            <span>Matricule Zeus</span>
+            <input id="employeeLoginMatricule" placeholder="Exemple : ZEUS001" autocomplete="username" required>
+          </label>
+          <div class="toolbar full">
+            <button class="secondary" type="submit">Entrer dans mon espace</button>
+          </div>
+        </form>
+      </section>
+    </div>
     <section class="panel">
       <div class="panel-header">
         <div>
@@ -291,10 +293,10 @@ function renderLogin() {
           <p>Export, import et sauvegarde manuelle des données RH.</p>
         </div>
       </div>
-      <div class="${state.durableDatabase ? "success" : "warning"}">
-        ${state.durableDatabase
-          ? `Base durable active : ${state.databasePath || "emplacement serveur"}`
-          : `Base non durable : ${state.databasePath || "emplacement temporaire"}. Active un disque Render pour conserver les données après redémarrage.`}
+      <div class="${state.durableDatabase ? "success" : "warning"} status-banner">
+        <span>${state.durableDatabase
+          ? `✅ Base durable active : ${state.databasePath || "emplacement serveur"}`
+          : `⚠ Base non durable : ${state.databasePath || "emplacement temporaire"}. Branche une base PostgreSQL externe pour conserver les données.`}</span>
       </div>
       <div class="toolbar">
         <button class="secondary" data-action="export-data">Exporter les données JSON</button>
@@ -615,11 +617,27 @@ function renderDashboard() {
   const alerts = generateAlerts().slice(0, 6);
   const recent = state.data.auditLog.slice(0, 5);
   return `
-    <div class="${API_MODE && state.apiReady && state.durableDatabase ? "success" : "warning"}">
-      ${API_MODE && state.apiReady
+    <div class="${API_MODE && state.apiReady && state.durableDatabase ? "success" : "warning"} status-banner">
+      <span>${API_MODE && state.apiReady
         ? `${state.durableDatabase ? "✅ Base durable active" : "⚠ Base active mais non durable"} : ${state.databasePath}`
-        : "⚠ Mode navigateur simple : lance LANCER_APPLICATION_RH.bat pour utiliser la vraie base de données."}
+        : "⚠ Mode navigateur simple : lance LANCER_APPLICATION_RH.bat pour utiliser la vraie base de données."}</span>
+      <span class="tag ${state.durableDatabase ? "green" : "orange"}">${state.durableDatabase ? "Stockage sécurisé" : "À sécuriser"}</span>
     </div>
+
+    <section class="panel">
+      <div class="panel-header">
+        <div>
+          <h3>Actions rapides</h3>
+          <p>Les opérations les plus utilisées sont ici, sans chercher dans les menus.</p>
+        </div>
+      </div>
+      <div class="quick-actions">
+        <button class="action-card" data-action="import-excel-modal"><strong>📥 Importer Excel</strong><span>Créer ou mettre à jour par matricule Zeus</span></button>
+        <button class="action-card" data-action="add-employee"><strong>👤 Ajouter un salarié</strong><span>Saisie manuelle d’une fiche complète</span></button>
+        <button class="action-card" data-go="documents"><strong>🗂️ Documents RH</strong><span>Demandes, modèles et génération</span></button>
+        <button class="action-card" data-go="alerts"><strong>🔔 Voir les alertes</strong><span>Contrats, congés, reprises, documents</span></button>
+      </div>
+    </section>
 
     ${state.data.employees.length === 0 ? `
       <section class="panel">
@@ -628,7 +646,10 @@ function renderDashboard() {
             <h3>Base RH vide</h3>
             <p>Aucune donnée fictive n’est chargée. Ajoute les collaborateurs réels pour commencer le suivi des contrats et congés.</p>
           </div>
-          <button class="primary" data-action="add-employee">Ajouter le premier collaborateur</button>
+          <div class="toolbar">
+            <button class="secondary" data-action="import-excel-modal">Importer depuis Excel</button>
+            <button class="primary" data-action="add-employee">Ajouter manuellement</button>
+          </div>
         </div>
       </section>
     ` : ""}
@@ -743,6 +764,12 @@ function renderEmployees() {
           <button class="primary" data-action="add-employee">Ajouter un collaborateur</button>
         </div>
       </div>
+      <div class="step-list">
+        <div class="step"><strong>1. Télécharger</strong><span>Récupère le modèle Excel avec les bonnes colonnes.</span></div>
+        <div class="step"><strong>2. Remplir</strong><span>Le matricule Zeus sert de clé unique pour chaque salarié.</span></div>
+        <div class="step"><strong>3. Importer</strong><span>Les fiches existantes sont mises à jour automatiquement.</span></div>
+      </div>
+      <br>
       <div class="table-wrap">
         <table>
           <thead>
@@ -979,6 +1006,9 @@ function renderDocuments() {
           <button class="primary" type="submit" ${hasEmployees ? "" : "disabled"}>Enregistrer la demande</button>
         </div>
       </form>
+      <div class="columns-list">
+        ${DOCUMENT_TYPES.map((type) => `<span class="tag blue">${type}</span>`).join("")}
+      </div>
     </section>
 
     <section class="panel">
@@ -989,6 +1019,8 @@ function renderDocuments() {
         </div>
         <button class="ghost" data-go="settings">Gérer les modèles</button>
       </div>
+      <div class="hint">Astuce : clique sur <strong>Générer</strong> pour produire le contenu à partir du modèle, puis <strong>Télécharger</strong> ou <strong>Transmis</strong> selon le traitement.</div>
+      <br>
       <div class="table-wrap">
         <table>
           <thead><tr><th>Collaborateur</th><th>Document</th><th>Demande</th><th>Statut</th><th>Actions</th></tr></thead>
