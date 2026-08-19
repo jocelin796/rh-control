@@ -27,7 +27,23 @@ Les fichiers de déploiement Render sont prêts :
 - `render.yaml` à la racine du dossier projet ;
 - `requirements.txt` dans `application-rh` ;
 - serveur compatible avec le port dynamique Render ;
-- base SQLite configurée pour être stockée sur `/var/data/rh_control.sqlite`.
+- mode gratuit Render compatible avec une base temporaire SQLite ;
+- mode durable gratuit compatible avec PostgreSQL externe via `DATABASE_URL`.
+
+### Option retenue sans paiement
+
+Pour ne rien payer, il ne faut pas utiliser de disque persistant Render ni Render Postgres gratuit.
+
+La configuration recommandée est :
+
+1. Application hébergée sur Render en plan gratuit.
+2. Base PostgreSQL gratuite externe, par exemple Supabase Free ou Neon Free.
+3. Variable Render à ajouter :
+   - `DATABASE_URL=postgresql://...`
+
+Quand `DATABASE_URL` est présent, l’application utilise automatiquement PostgreSQL et l’indicateur affiche `Base durable active`.
+
+Important : Render Postgres gratuit n’est pas retenu, car cette base expire après 30 jours.
 
 ### Option recommandée : Blueprint Render
 
@@ -47,14 +63,10 @@ Créer un `Web Service` avec ces paramètres :
 - Build Command : `python -m pip install -r requirements.txt`
 - Start Command : `python server.py`
 - Environment Variable :
-  - `RH_DATABASE_PATH=/var/data/rh_control.sqlite`
+  - `RH_DATABASE_PATH=/tmp/rh_control.sqlite` si aucune base externe n’est encore branchée ;
+  - `DATABASE_URL=postgresql://...` dès que la base gratuite externe est créée.
 
-Ajouter ensuite un disque persistant :
-
-- Mount Path : `/var/data`
-- Size : `1 GB`
-
-Important : sans disque persistant, la base SQLite peut être perdue après redémarrage ou redéploiement.
+Important : sans `DATABASE_URL`, la base SQLite Render reste temporaire et peut être perdue après redémarrage ou redéploiement.
 
 ## Sécurité légère
 
@@ -71,24 +83,20 @@ Dans l’onglet `Paramétrage`, une section `Maintenance base de données` perme
 
 - d’exporter les données RH en JSON ;
 - d’importer un export JSON ;
-- de créer une sauvegarde serveur de la base SQLite.
+- de créer une sauvegarde serveur SQLite ou une copie JSON si la base est PostgreSQL.
 
-Sur Render gratuit, ces sauvegardes serveur restent temporaires. Pour qu’elles soient durables, il faut un disque persistant.
+Sur Render gratuit, les sauvegardes serveur restent temporaires. La sauvegarde la plus sûre reste `Exporter les données JSON`, puis conserver le fichier localement.
 
-## État actuel Render gratuit
+## État Render gratuit
 
-Le plan gratuit Render ne permet pas de disque persistant pour SQLite. La base peut donc être perdue après redémarrage ou redéploiement.
+Le plan gratuit Render ne permet pas de disque persistant pour SQLite. La base SQLite peut donc être perdue après redémarrage ou redéploiement.
 
-Pour rendre SQLite durable sur Render :
+La solution gratuite retenue est donc :
 
-1. Ajouter un moyen de paiement au compte Render.
-2. Passer le service web à un plan payant.
-3. Ajouter un disque persistant :
-   - Mount Path : `/var/data`
-   - Size : `1 GB`
-4. Définir :
-   - `RH_DATABASE_PATH=/var/data/rh_control.sqlite`
-5. Redéployer le service.
+1. Créer une base PostgreSQL gratuite externe.
+2. Copier l’URL de connexion.
+3. La mettre dans Render avec le nom `DATABASE_URL`.
+4. Redéployer le service.
 
 ## Ouverture sans serveur
 
@@ -115,7 +123,7 @@ Il est toujours possible d’ouvrir `index.html` directement, mais dans ce mode 
 
 ## Données
 
-La version connectée au serveur utilise maintenant une base SQLite structurée avec les tables suivantes :
+La version locale utilise une base SQLite structurée avec les tables suivantes :
 
 - `employees`
 - `leave_balances`
@@ -127,6 +135,8 @@ La version connectée au serveur utilise maintenant une base SQLite structurée 
 - `documents`
 - `audit_log`
 - `settings`
+
+La version en ligne gratuite et durable peut utiliser PostgreSQL externe. Dans ce mode, l’état de l’application est conservé dans la table `app_state`.
 
 Pour une version production, il faudra ajouter :
 

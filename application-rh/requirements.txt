@@ -1,2 +1,1 @@
-# Aucune dépendance externe obligatoire pour cette version.
-# Render exécutera quand même ce fichier pendant le build.
+psycopg[binary]>=3,<4

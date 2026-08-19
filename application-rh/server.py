@@ -13,12 +13,25 @@ import webbrowser
 from datetime import datetime
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
+
+try:
+    import psycopg
+except ImportError:  # PostgreSQL reste optionnel pour l'utilisation locale SQLite.
+    psycopg = None
 
 ROOT = Path(__file__).resolve().parent
 LOCAL_DB_DIR = ROOT / "database"
 SCHEMA_PATH = LOCAL_DB_DIR / "schema.sql"
 RENDER_DB_PATH = Path("/var/data/rh_control.sqlite")
+DATABASE_URL = (
+    os.environ.get("DATABASE_URL")
+    or os.environ.get("POSTGRES_URL")
+    or os.environ.get("SUPABASE_DB_URL")
+    or os.environ.get("NEON_DATABASE_URL")
+)
+DB_MODE = "postgres" if DATABASE_URL else "sqlite"
 DB_PATH = Path(os.environ.get("RH_DATABASE_PATH") or (RENDER_DB_PATH if os.environ.get("RENDER") else LOCAL_DB_DIR / "rh_control.sqlite"))
 DB_DIR = DB_PATH.parent
 HOST = os.environ.get("HOST") or ("0.0.0.0" if os.environ.get("PORT") else "127.0.0.1")
@@ -27,9 +40,55 @@ APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 APP_SESSION_SECRET = os.environ.get("APP_SESSION_SECRET") or APP_PASSWORD or "local-dev-session-secret"
 SESSION_COOKIE = "rh_session"
 SESSION_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+DEFAULT_SETTINGS = {
+    "contractAlertDays": [90, 60, 30, 15, 7],
+    "returnAlertDays": [3, 1, 0],
+    "workingDays": [1, 2, 3, 4, 5],
+    "holidays": ["2026-01-01", "2026-04-06", "2026-05-01", "2026-08-07", "2026-12-25"],
+    "allowExceptionalLeave": True,
+    "ticketEnabled": True,
+}
+
+
+def default_state() -> dict:
+    return {
+        "currentRole": "Admin RH",
+        "settings": dict(DEFAULT_SETTINGS),
+        "employees": [],
+        "leaveRequests": [],
+        "documents": [],
+        "auditLog": [],
+    }
+
+
+def normalize_state(value: Any) -> dict:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            value = {}
+    if not isinstance(value, dict):
+        value = {}
+
+    state = default_state()
+    state["currentRole"] = value.get("currentRole") or state["currentRole"]
+
+    settings = dict(DEFAULT_SETTINGS)
+    incoming_settings = value.get("settings")
+    if isinstance(incoming_settings, dict):
+        settings.update(incoming_settings)
+    state["settings"] = settings
+
+    for key in ["employees", "leaveRequests", "documents", "auditLog"]:
+        items = value.get(key)
+        state[key] = items if isinstance(items, list) else []
+
+    return state
 
 
 def connect() -> sqlite3.Connection:
+    if DB_MODE != "sqlite":
+        raise RuntimeError("La connexion SQLite est appelée alors que PostgreSQL est configuré.")
     DB_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -37,7 +96,17 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+def connect_postgres():
+    if psycopg is None:
+        raise RuntimeError("La dépendance PostgreSQL n'est pas installée. Vérifiez requirements.txt et relancez le build.")
+    return psycopg.connect(DATABASE_URL)
+
+
 def init_db() -> None:
+    if DB_MODE == "postgres":
+        init_postgres_db()
+        return
+
     with connect() as conn:
         schema = SCHEMA_PATH.read_text(encoding="utf-8")
         conn.executescript(schema)
@@ -47,11 +116,47 @@ def init_db() -> None:
         )
 
 
+def init_postgres_db() -> None:
+    with connect_postgres() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS app_state (
+                  key TEXT PRIMARY KEY,
+                  value JSONB NOT NULL,
+                  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            cur.execute(
+                """
+                INSERT INTO app_state(key, value)
+                VALUES (%s, %s::jsonb)
+                ON CONFLICT (key) DO NOTHING
+                """,
+                ("main", json.dumps(default_state(), ensure_ascii=False)),
+            )
+
+
 def db_is_durable() -> bool:
+    if DB_MODE == "postgres":
+        return True
     path = str(DB_PATH).replace("\\", "/")
     if os.environ.get("RENDER"):
         return path.startswith("/var/data/")
     return True
+
+
+def database_label() -> str:
+    if DB_MODE == "postgres":
+        return "PostgreSQL externe (DATABASE_URL)"
+    return str(DB_PATH)
+
+
+def backup_root() -> Path:
+    if DB_MODE == "postgres" and os.environ.get("RENDER"):
+        return Path("/tmp/rh-control-backups")
+    return DB_DIR / "backups"
 
 
 def auth_required() -> bool:
@@ -119,7 +224,51 @@ def json_value(value, fallback):
         return fallback
 
 
+def get_postgres_state() -> dict:
+    with connect_postgres() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT value FROM app_state WHERE key = %s", ("main",))
+            row = cur.fetchone()
+            if not row:
+                return default_state()
+            return normalize_state(row[0])
+
+
+def save_postgres_state(data: dict) -> None:
+    state = normalize_state(data)
+    with connect_postgres() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO app_state(key, value, updated_at)
+                VALUES (%s, %s::jsonb, NOW())
+                ON CONFLICT (key)
+                DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+                """,
+                ("main", json.dumps(state, ensure_ascii=False)),
+            )
+
+
+def create_database_backup() -> tuple[str, str]:
+    backup_dir = backup_root()
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    if DB_MODE == "postgres":
+        backup_path = backup_dir / f"rh_control_backup_{stamp}.json"
+        backup_path.write_text(json.dumps(get_state(), ensure_ascii=False, indent=2), encoding="utf-8")
+        return str(backup_path), "json"
+
+    backup_path = backup_dir / f"rh_control_backup_{stamp}.sqlite"
+    if DB_PATH.exists():
+        shutil.copy2(DB_PATH, backup_path)
+    return str(backup_path), "sqlite"
+
+
 def get_state() -> dict:
+    if DB_MODE == "postgres":
+        return get_postgres_state()
+
     with connect() as conn:
         settings_rows = rows(conn, "SELECT key, value FROM settings")
         settings = {item["key"]: json_value(item["value"], item["value"]) for item in settings_rows}
@@ -224,14 +373,7 @@ def get_state() -> dict:
             for item in rows(conn, "SELECT * FROM audit_log ORDER BY sort_order, id")
         ]
 
-        default_settings = {
-            "contractAlertDays": [90, 60, 30, 15, 7],
-            "returnAlertDays": [3, 1, 0],
-            "workingDays": [1, 2, 3, 4, 5],
-            "holidays": ["2026-01-01", "2026-04-06", "2026-05-01", "2026-08-07", "2026-12-25"],
-            "allowExceptionalLeave": True,
-            "ticketEnabled": True,
-        }
+        default_settings = dict(DEFAULT_SETTINGS)
         default_settings.update(settings)
 
         role_row = one(conn, "SELECT value FROM app_meta WHERE key = ?", ("current_role",))
@@ -247,6 +389,10 @@ def get_state() -> dict:
 
 
 def save_state(data: dict) -> None:
+    if DB_MODE == "postgres":
+        save_postgres_state(data)
+        return
+
     with connect() as conn:
         conn.execute("BEGIN")
         for table in [
@@ -454,8 +600,8 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/health":
             self.send_json({
                 "ok": True,
-                "database": str(DB_PATH),
-                "mode": "sqlite",
+                "database": database_label(),
+                "mode": DB_MODE,
                 "durable": db_is_durable(),
                 "authRequired": auth_required(),
             })
@@ -472,7 +618,7 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             self.send_json({
                 "ok": True,
-                "database": str(DB_PATH),
+                "database": database_label(),
                 "durable": db_is_durable(),
                 "data": get_state(),
             })
@@ -508,12 +654,8 @@ class Handler(SimpleHTTPRequestHandler):
             if not self.require_auth():
                 return
             try:
-                backup_dir = DB_DIR / "backups"
-                backup_dir.mkdir(parents=True, exist_ok=True)
-                backup_path = backup_dir / f"rh_control_backup_{datetime.now():%Y%m%d_%H%M%S}.sqlite"
-                if DB_PATH.exists():
-                    shutil.copy2(DB_PATH, backup_path)
-                self.send_json({"ok": True, "backup": str(backup_path), "durable": db_is_durable()})
+                backup_path, backup_type = create_database_backup()
+                self.send_json({"ok": True, "backup": backup_path, "type": backup_type, "durable": db_is_durable()})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=500)
             return
@@ -527,7 +669,7 @@ class Handler(SimpleHTTPRequestHandler):
             try:
                 payload = self.read_json()
                 save_state(payload.get("data", payload))
-                self.send_json({"ok": True, "database": str(DB_PATH)})
+                self.send_json({"ok": True, "database": database_label()})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=500)
             return
@@ -538,7 +680,7 @@ class Handler(SimpleHTTPRequestHandler):
                 payload = self.read_json()
                 data = payload.get("data", payload)
                 save_state(data)
-                self.send_json({"ok": True, "database": str(DB_PATH), "data": get_state()})
+                self.send_json({"ok": True, "database": database_label(), "data": get_state()})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=500)
             return
@@ -551,7 +693,7 @@ def main() -> None:
     url = f"http://{display_host}:{PORT}/"
     print("Application RH démarrée")
     print(f"URL        : {url}")
-    print(f"Base SQLite: {DB_PATH}")
+    print(f"Base       : {database_label()}")
     if not os.environ.get("PORT"):
         print("Laisse cette fenêtre ouverte pendant l'utilisation.")
     if "--no-browser" not in sys.argv and not os.environ.get("PORT"):
