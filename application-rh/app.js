@@ -1,6 +1,8 @@
 const STORAGE_KEY = "rh-control-module-real-v2";
 const API_MODE = location.protocol !== "file:";
 let saveTimer = null;
+let pendingExcelFile = null;
+let lastExcelPreview = null;
 
 const viewTitles = {
   dashboard: "Tableau de bord",
@@ -53,8 +55,12 @@ const ACTION_ROLES = {
   "leave-approve": ["Admin RH", "Direction"],
   "leave-refuse": ["Admin RH", "Assistant RH", "Direction"],
   "generate-doc-request": ["Admin RH", "Assistant RH"],
+  "download-doc-request": ["Admin RH", "Assistant RH", "Direction"],
+  "download-ticket": ["Admin RH", "Assistant RH", "Direction"],
   "transmit-doc-request": ["Admin RH", "Assistant RH"],
   "refuse-doc-request": ["Admin RH", "Assistant RH"],
+  "confirm-excel-import": ["Admin RH", "Assistant RH"],
+  "download-import-report": ["Admin RH", "Assistant RH"],
   "restore-template": ["Admin RH"],
   "export-data": ["Admin RH"],
   "import-data": ["Admin RH"],
@@ -146,6 +152,8 @@ const state = {
   apiReady: false,
   authRequired: false,
   authenticated: false,
+  serverRole: "",
+  emailConfigured: false,
   durableDatabase: false,
   databasePath: "",
   employeePortal: { active: false, data: null },
@@ -168,6 +176,7 @@ function defaultState() {
     documentRequests: [],
     documents: [],
     documentTemplates: { ...DEFAULT_DOCUMENT_TEMPLATES },
+    notifications: [],
     auditLog: [],
   };
 }
@@ -186,6 +195,7 @@ function normalizeData(data) {
     documentRequests: Array.isArray(incoming.documentRequests) ? incoming.documentRequests : [],
     documents: Array.isArray(incoming.documents) ? incoming.documents : [],
     documentTemplates: templates,
+    notifications: Array.isArray(incoming.notifications) ? incoming.notifications : [],
     auditLog: Array.isArray(incoming.auditLog) ? incoming.auditLog : [],
   };
 }
@@ -205,6 +215,7 @@ function saveState() {
     return;
   }
   if (!state.apiReady) return;
+  if (!canWriteWholeState()) return;
   clearTimeout(saveTimer);
   saveTimer = setTimeout(async () => {
     try {
@@ -259,6 +270,7 @@ async function initApp() {
       const auth = await authResponse.json();
       state.authRequired = Boolean(auth.authRequired);
       state.authenticated = Boolean(auth.authenticated);
+      state.serverRole = state.authRequired && auth.role ? auth.role : "";
       if (state.authRequired && !state.authenticated) {
         const employeeStatus = await fetch("/api/employee/status", { credentials: "same-origin" });
         const employeeAuth = await employeeStatus.json().catch(() => ({}));
@@ -280,7 +292,10 @@ async function initApp() {
     const payload = await response.json();
     state.databasePath = payload.database || "";
     state.durableDatabase = Boolean(payload.durable);
+    state.emailConfigured = Boolean(payload.emailConfigured);
     state.data = normalizeData(payload.data || defaultState());
+    state.serverRole = state.authRequired && payload.role ? payload.role : state.serverRole;
+    if (state.serverRole) state.data.currentRole = state.serverRole;
     state.apiReady = true;
     state.authenticated = true;
     render();
@@ -306,7 +321,15 @@ function renderLogin() {
         </div>
         <form id="loginForm" class="form-grid">
           <label class="full">
-            <span>Mot de passe administrateur</span>
+            <span>Rôle</span>
+            <select id="loginRole">
+              <option>Admin RH</option>
+              <option>Assistant RH</option>
+              <option>Direction</option>
+            </select>
+          </label>
+          <label class="full">
+            <span>Mot de passe du rôle</span>
             <input id="loginPassword" type="password" autocomplete="current-password" required autofocus>
           </label>
           <div class="toolbar full">
@@ -610,6 +633,8 @@ function metrics() {
     expiredContracts: contracts.filter((c) => c.end && diffDays(c.end) < 0).length,
     currentLeaves: leaves.filter((l) => l.status === "Validé" && isBetween(todayIso, l.start, l.end)).length,
     pendingLeaves: leaves.filter((l) => ["Demande envoyée", "En attente de validation Direction"].includes(l.status)).length,
+    pendingRhLeaves: leaves.filter((l) => ["Demande envoyée", "Modification demandée"].includes(l.status)).length,
+    pendingDirectionLeaves: leaves.filter((l) => l.status === "En attente de validation Direction").length,
     approvedLeaves: leaves.filter((l) => l.status === "Validé").length,
     returnsToday: leaves.filter((l) => l.status === "Validé" && l.returnDate === todayIso).length,
     returnsWeek: leaves.filter((l) => l.status === "Validé" && isThisWeek(l.returnDate)).length,
@@ -620,8 +645,59 @@ function metrics() {
   };
 }
 
+function decisionMetrics() {
+  const buckets = new Map();
+  const ensure = (service) => {
+    const key = service || "Non renseigné";
+    if (!buckets.has(key)) {
+      buckets.set(key, {
+        service: key,
+        employees: 0,
+        expiring30: 0,
+        expiring60: 0,
+        expiring90: 0,
+        expired: 0,
+        pendingLeaves: 0,
+        lowBalances: 0,
+        score: 0,
+      });
+    }
+    return buckets.get(key);
+  };
+  state.data.employees.forEach((employee) => {
+    const item = ensure(employee.service);
+    item.employees += 1;
+    const contract = getCurrentContract(employee);
+    const days = contract.end ? diffDays(contract.end) : null;
+    if (days !== null && days < 0) item.expired += 1;
+    else if (days !== null && days <= 30) item.expiring30 += 1;
+    else if (days !== null && days <= 60) item.expiring60 += 1;
+    else if (days !== null && days <= 90) item.expiring90 += 1;
+    if ((employee.leaveBalance?.available ?? 0) < 5) item.lowBalances += 1;
+  });
+  state.data.leaveRequests
+    .filter((leave) => ["Demande envoyée", "Modification demandée", "En attente de validation Direction"].includes(leave.status))
+    .forEach((leave) => {
+      const employee = getEmployee(leave.employeeId);
+      if (!employee) return;
+      ensure(employee.service).pendingLeaves += 1;
+    });
+  const rows = [...buckets.values()].map((item) => ({
+    ...item,
+    score: item.expired * 5 + item.expiring30 * 4 + item.expiring60 * 2 + item.expiring90 + item.pendingLeaves * 2 + item.lowBalances,
+  }));
+  return {
+    contract30: rows.reduce((sum, item) => sum + item.expiring30, 0),
+    contract60: rows.reduce((sum, item) => sum + item.expiring60, 0),
+    contract90: rows.reduce((sum, item) => sum + item.expiring90, 0),
+    riskGroups: rows.filter((item) => item.score > 0).sort((a, b) => b.score - a.score).slice(0, 5),
+    stableGroups: rows.filter((item) => item.score === 0).sort((a, b) => b.employees - a.employees).slice(0, 5),
+  };
+}
+
 function currentRole() {
-  return state.data.currentRole || "Admin RH";
+  if (state.employeePortal.active) return "Collaborateur";
+  return state.serverRole || state.data.currentRole || "Admin RH";
 }
 
 function roleConfig(role = currentRole()) {
@@ -635,6 +711,10 @@ function canView(view, role = currentRole()) {
 function canDo(action, role = currentRole()) {
   const allowedRoles = ACTION_ROLES[action];
   return !allowedRoles || allowedRoles.includes(role);
+}
+
+function canWriteWholeState(role = currentRole()) {
+  return !API_MODE || ["Admin RH", "Assistant RH"].includes(role);
 }
 
 function firstAllowedView(role = currentRole()) {
@@ -665,7 +745,16 @@ function updateRoleVisibility() {
     section.hidden = !hasVisibleItem;
   });
   const roleHelp = document.getElementById("roleHelp");
-  if (roleHelp) roleHelp.textContent = roleConfig(role).help;
+  if (roleHelp) {
+    roleHelp.textContent = state.serverRole
+      ? `${roleConfig(role).help} Rôle verrouillé par la session connectée.`
+      : roleConfig(role).help;
+  }
+  const roleSelect = document.getElementById("roleSelect");
+  if (roleSelect) {
+    roleSelect.value = role;
+    roleSelect.disabled = Boolean(state.serverRole || state.employeePortal.active);
+  }
   const resetButton = document.getElementById("resetDemo");
   if (resetButton) resetButton.hidden = role !== "Admin RH";
 }
@@ -696,7 +785,7 @@ function render() {
     history: renderHistory,
   };
   content.innerHTML = renderers[state.view]();
-  document.getElementById("roleSelect").value = state.data.currentRole;
+  document.getElementById("roleSelect").value = currentRole();
   updateRoleVisibility();
   saveState();
 }
@@ -731,8 +820,10 @@ function renderDashboard() {
     `;
   }
   const m = metrics();
+  const d = decisionMetrics();
   const alerts = generateAlerts().slice(0, 6);
   const recent = state.data.auditLog.slice(0, 5);
+  const recentNotifications = (state.data.notifications || []).slice(0, 4);
   const quickActions = [
     canDo("import-excel-modal") ? `<button class="action-card" data-action="import-excel-modal"><strong>📥 Importer Excel</strong><span>Créer ou mettre à jour par matricule Zeus</span></button>` : "",
     canDo("add-employee") ? `<button class="action-card" data-action="add-employee"><strong>👤 Ajouter un salarié</strong><span>Saisie manuelle d’une fiche complète</span></button>` : "",
@@ -787,6 +878,57 @@ function renderDashboard() {
       ${kpiCard("Reprises cette semaine", m.returnsWeek, `${m.returnsToday} reprise(s) aujourd'hui`)}
     </div>
 
+    <section class="panel">
+      <div class="panel-header">
+        <div>
+          <h3>Lecture décisionnelle</h3>
+          <p>Ce qui demande une action rapide : contrats, validations, documents et soldes faibles.</p>
+        </div>
+      </div>
+      <div class="grid four">
+        ${kpiCard("Contrats ≤ 30 jours", d.contract30, "À renouveler en priorité", d.contract30 ? "orange" : "")}
+        ${kpiCard("Contrats 31-60 jours", d.contract60, "À anticiper", d.contract60 ? "blue" : "")}
+        ${kpiCard("Attente RH", m.pendingRhLeaves, "Demandes à contrôler par RH")}
+        ${kpiCard("Attente Direction", m.pendingDirectionLeaves, "Demandes à valider/refuser")}
+      </div>
+      <div class="grid two">
+        <div>
+          <h4>Ce qui tire vers le bas</h4>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Groupe</th><th>Risque</th><th>Détail</th></tr></thead>
+              <tbody>
+                ${d.riskGroups.map((item) => `
+                  <tr>
+                    <td><strong>${escapeHtml(item.service)}</strong><br><span class="muted">${item.employees} collaborateur(s)</span></td>
+                    <td>${tag(item.score, item.score >= 8 ? "red" : "orange")}</td>
+                    <td>${item.expired} expiré · ${item.expiring30} ≤30j · ${item.pendingLeaves} congé(s) · ${item.lowBalances} solde(s) bas</td>
+                  </tr>
+                `).join("") || `<tr><td colspan="3">Aucun groupe à risque actuellement.</td></tr>`}
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div>
+          <h4>Ce qui tire vers le haut</h4>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Groupe</th><th>Situation</th><th>Lecture</th></tr></thead>
+              <tbody>
+                ${d.stableGroups.map((item) => `
+                  <tr>
+                    <td><strong>${escapeHtml(item.service)}</strong></td>
+                    <td>${tag("Stable", "green")}</td>
+                    <td>${item.employees} collaborateur(s), aucune alerte majeure détectée.</td>
+                  </tr>
+                `).join("") || `<tr><td colspan="3">La stabilité apparaîtra après import des collaborateurs réels.</td></tr>`}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <div class="grid two">
       <section class="panel">
         <div class="panel-header">
@@ -827,6 +969,38 @@ function renderDashboard() {
         </div>
       </section>
     </div>
+
+    <section class="panel">
+      <div class="panel-header">
+        <div>
+          <h3>Notifications</h3>
+          <p>${state.emailConfigured ? "Envoi e-mail activé sur le serveur." : "Journal interne actif. L’e-mail réel sera activé quand une messagerie SMTP gratuite sera branchée."}</p>
+        </div>
+        <span class="tag ${state.emailConfigured ? "green" : "gray"}">${state.emailConfigured ? "E-mail actif" : "E-mail à configurer"}</span>
+      </div>
+      <div class="timeline">
+        ${recentNotifications.map((item) => `
+          <div class="timeline-item">
+            <strong>${escapeHtml(item.status || "Journalisé")} · ${escapeHtml(item.subject || "")}</strong>
+            <span>${escapeHtml(item.body || "")}</span>
+          </div>
+        `).join("") || `<div class="empty-state">Aucune notification enregistrée pour le moment.</div>`}
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <div>
+          <h3>Notifications e-mail</h3>
+          <p>Les demandes créent toujours une trace interne. L’envoi e-mail réel dépend du paramétrage serveur SMTP.</p>
+        </div>
+        <span class="tag ${state.emailConfigured ? "green" : "orange"}">${state.emailConfigured ? "SMTP actif" : "SMTP non configuré"}</span>
+      </div>
+      <div class="hint">
+        Événements prévus : nouvelle demande de congé, demande transmise à la Direction, validation/refus, nouvelle demande de document.
+        Pour rester gratuit, on branchera une messagerie SMTP gratuite quand tu me donneras les accès techniques.
+      </div>
+    </section>
 
     <section class="panel">
       <div class="panel-header">
@@ -1042,7 +1216,7 @@ function renderLeaves() {
       <div class="panel-header">
         <div>
           <h3>Demandes de congés</h3>
-          <p>Rôle actif : <strong>${state.data.currentRole}</strong>. Les boutons de validation changent selon ce rôle.</p>
+          <p>Rôle actif : <strong>${currentRole()}</strong>. Les boutons de validation changent selon ce rôle.</p>
         </div>
       </div>
       <div class="table-wrap">
@@ -1062,7 +1236,7 @@ function overlapWarning(leave) {
 }
 
 function leaveActions(leave) {
-  const role = state.data.currentRole;
+  const role = currentRole();
   const actions = [];
   actions.push(`<button data-action="leave-details" data-id="${leave.id}">Détails</button>`);
   if (role === "Assistant RH" || role === "Admin RH") {
@@ -1154,7 +1328,10 @@ function renderDocuments() {
 function documentRequestActions(request) {
   const actions = [`<button data-action="doc-request-details" data-id="${request.id}">Détails</button>`];
   if (!request.content && canDo("generate-doc-request")) actions.push(`<button data-action="generate-doc-request" data-id="${request.id}">Générer</button>`);
-  if (request.content) actions.push(`<button data-action="download-doc-request" data-id="${request.id}">Télécharger</button>`);
+  if (request.content) {
+    actions.push(`<button data-action="download-doc-request" data-format="docx" data-id="${request.id}">Word</button>`);
+    actions.push(`<button data-action="download-doc-request" data-format="pdf" data-id="${request.id}">PDF</button>`);
+  }
   if (request.status !== "Document transmis" && canDo("transmit-doc-request")) actions.push(`<button data-action="transmit-doc-request" data-id="${request.id}">Transmis</button>`);
   if (!["Document transmis", "Refusé"].includes(request.status) && canDo("refuse-doc-request")) actions.push(`<button data-action="refuse-doc-request" data-id="${request.id}">Refuser</button>`);
   return actions.join("");
@@ -1758,15 +1935,35 @@ function viewDocumentRequest(id) {
   openModal(
     "Détail demande de document",
     body,
-    `${request.content ? `<button class="primary" data-action="download-doc-request" data-id="${id}">Télécharger</button>` : `<button class="primary" data-action="generate-doc-request" data-id="${id}">Générer</button>`}<button class="ghost" data-action="close-modal">Fermer</button>`
+    `${request.content
+      ? `<button class="primary" data-action="download-doc-request" data-format="docx" data-id="${id}">Télécharger Word</button><button class="secondary" data-action="download-doc-request" data-format="pdf" data-id="${id}">Télécharger PDF</button>`
+      : `<button class="primary" data-action="generate-doc-request" data-id="${id}">Générer</button>`}<button class="ghost" data-action="close-modal">Fermer</button>`
   );
 }
 
-function downloadDocumentRequest(id) {
+async function downloadDocumentRequest(id, format = "docx") {
   const request = getDocumentRequest(id);
   if (!request.content) generateDocumentRequest(id);
   const refreshed = getDocumentRequest(id);
   const employee = getEmployee(refreshed.employeeId);
+  const title = `${refreshed.type} - ${employee.matricule}`;
+  if (API_MODE) {
+    const response = await apiFetch("/api/documents/render", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title, content: refreshed.content, format }),
+    });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      showToast(payload.error || "Document impossible à générer.");
+      return;
+    }
+    const blob = await response.blob();
+    const extension = format === "pdf" ? "pdf" : "docx";
+    downloadBlob(blob, `${refreshed.type}_${employee.matricule}.${extension}`.replace(/\s+/g, "_").toLowerCase());
+    showToast(`Document ${extension.toUpperCase()} téléchargé.`);
+    return;
+  }
   const blob = new Blob([refreshed.content], { type: "text/plain;charset=utf-8" });
   downloadBlob(blob, `${refreshed.type}_${employee.matricule}.txt`.replace(/\s+/g, "_").toLowerCase());
   showToast("Document téléchargé.");
@@ -1797,10 +1994,33 @@ function refuseDocumentRequest(id) {
   render();
 }
 
-function transitionLeave(id, action) {
+async function transitionLeave(id, action) {
   const leave = state.data.leaveRequests.find((item) => item.id === id);
   const employee = getEmployee(leave.employeeId);
   const observation = prompt("Observation à enregistrer :", "") || "";
+  if (API_MODE) {
+    const response = await apiFetch("/api/admin/leave-transition", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, action, observation }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || !payload.ok) {
+      showToast(payload.error || "Action impossible pour ce rôle.");
+      return;
+    }
+    state.data = normalizeData(payload.data || state.data);
+    if (state.serverRole) state.data.currentRole = state.serverRole;
+    const messages = {
+      "to-direction": "Demande transmise à la Direction.",
+      modify: "Modification demandée.",
+      refuse: "Demande refusée.",
+      approve: "Congé validé et ticket généré si option activée.",
+    };
+    showToast(messages[action] || "Action enregistrée.");
+    render();
+    return;
+  }
   if (action === "to-direction") {
     leave.status = "En attente de validation Direction";
     leave.observations.push(`Assistant RH : ${observation || "demande vérifiée et transmise à la Direction."}`);
@@ -1817,9 +2037,9 @@ function transitionLeave(id, action) {
   }
   if (action === "refuse") {
     leave.status = "Refusé";
-    leave.observations.push(`${state.data.currentRole} : ${observation || "demande refusée."}`);
+    leave.observations.push(`${currentRole()} : ${observation || "demande refusée."}`);
     leave.history.push(`${formatDate(toISO(today()))} : demande refusée.`);
-    audit(state.data.currentRole, `Demande de congé refusée pour ${fullName(employee)}.`);
+    audit(currentRole(), `Demande de congé refusée pour ${fullName(employee)}.`);
     showToast("Demande refusée.");
   }
   if (action === "approve") {
@@ -1976,19 +2196,23 @@ function parseNumberList(value) {
 async function login(event) {
   event.preventDefault();
   const password = document.getElementById("loginPassword").value;
+  const role = document.getElementById("loginRole").value;
   const response = await fetch("/api/auth/login", {
     method: "POST",
     credentials: "same-origin",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ password }),
+    body: JSON.stringify({ password, role }),
   });
+  const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
     showToast("Mot de passe incorrect.");
     return;
   }
+  state.serverRole = payload.role || role;
+  state.data.currentRole = state.serverRole;
   state.authenticated = true;
   state.employeePortal = { active: false, data: null };
-  showToast("Connexion réussie.");
+  showToast(`Connexion réussie : ${state.serverRole}.`);
   await initApp();
 }
 
@@ -2157,6 +2381,7 @@ async function logout() {
   await fetch("/api/auth/logout", { method: "POST", credentials: "same-origin" });
   state.authenticated = false;
   state.apiReady = false;
+  state.serverRole = "";
   state.employeePortal = { active: false, data: null };
   renderLogin();
 }
@@ -2254,6 +2479,71 @@ async function importEmployeeExcel(file) {
   }
   const form = new FormData();
   form.append("file", file);
+  const response = await apiFetch("/api/employees/preview-excel", {
+    method: "POST",
+    body: form,
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || !payload.ok) {
+    showToast(payload.error || "Lecture Excel impossible.");
+    return;
+  }
+  pendingExcelFile = file;
+  lastExcelPreview = payload;
+  openExcelPreviewModal(payload);
+}
+
+function openExcelPreviewModal(payload) {
+  const rows = payload.rows || [];
+  const errorRows = rows.filter((row) => row.errors?.length);
+  const visibleRows = rows.slice(0, 80);
+  openModal(
+    "Aperçu avant import Excel",
+    `
+      <div class="${errorRows.length ? "warning" : "success"}">
+        ${errorRows.length
+          ? `⚠ ${errorRows.length} ligne(s) à corriger avant import.`
+          : "✅ Fichier prêt à importer dans la base."}
+        <br>
+        Créations : <strong>${payload.created || 0}</strong> · Mises à jour : <strong>${payload.updated || 0}</strong> · Ignorées : <strong>${payload.skipped || 0}</strong>
+      </div>
+      ${(payload.missingColumns || []).length ? `<div class="warning">Colonnes absentes du fichier : ${(payload.missingColumns || []).map(escapeHtml).join(", ")}</div>` : ""}
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Ligne</th><th>Matricule</th><th>Nom</th><th>Département</th><th>Action</th><th>Contrôle</th></tr></thead>
+          <tbody>
+            ${visibleRows.map((row) => `
+              <tr>
+                <td>${row.row}</td>
+                <td>${escapeHtml(row.matricule || "—")}</td>
+                <td>${escapeHtml(row.name || "—")}</td>
+                <td>${escapeHtml(row.department || "—")}</td>
+                <td>${tag(row.action || "—", row.action === "Erreur" ? "red" : row.action === "Mise à jour" ? "orange" : "green")}</td>
+                <td>
+                  ${(row.errors || []).map((item) => `<div class="tag red">${escapeHtml(item)}</div>`).join("")}
+                  ${(row.warnings || []).map((item) => `<div class="tag orange">${escapeHtml(item)}</div>`).join("")}
+                  ${!(row.errors || []).length && !(row.warnings || []).length ? `<span class="muted">OK</span>` : ""}
+                </td>
+              </tr>
+            `).join("") || `<tr><td colspan="6">Aucune ligne détectée.</td></tr>`}
+          </tbody>
+        </table>
+      </div>
+      ${rows.length > visibleRows.length ? `<div class="hint">${rows.length - visibleRows.length} autre(s) ligne(s) non affichée(s) ici. Télécharge le rapport pour tout voir.</div>` : ""}
+    `,
+    `<button class="ghost" data-action="download-import-report">Télécharger le rapport</button>
+     <button class="primary" data-action="confirm-excel-import" ${errorRows.length ? "disabled" : ""}>Confirmer l’import</button>
+     <button class="ghost" data-action="close-modal">Fermer</button>`
+  );
+}
+
+async function confirmEmployeeExcelImport() {
+  if (!pendingExcelFile) {
+    showToast("Choisis d’abord un fichier Excel.");
+    return;
+  }
+  const form = new FormData();
+  form.append("file", pendingExcelFile);
   const response = await apiFetch("/api/employees/import-excel", {
     method: "POST",
     body: form,
@@ -2264,9 +2554,34 @@ async function importEmployeeExcel(file) {
     return;
   }
   state.data = normalizeData(payload.data || state.data);
+  if (state.serverRole) state.data.currentRole = state.serverRole;
+  pendingExcelFile = null;
+  lastExcelPreview = payload.preview || lastExcelPreview;
   closeModal();
   showToast(`Import Excel terminé : ${payload.created} créé(s), ${payload.updated} mis à jour, ${payload.skipped} ignoré(s).`);
   render();
+}
+
+function downloadExcelPreviewReport() {
+  if (!lastExcelPreview?.rows?.length) {
+    showToast("Aucun rapport d’import disponible.");
+    return;
+  }
+  const header = ["Ligne", "Matricule", "Nom", "Département", "Fonction", "Action", "Erreurs", "Avertissements"];
+  const lines = [header, ...lastExcelPreview.rows.map((row) => [
+    row.row,
+    row.matricule || "",
+    row.name || "",
+    row.department || "",
+    row.function || "",
+    row.action || "",
+    (row.errors || []).join(" | "),
+    (row.warnings || []).join(" | "),
+  ])];
+  const csv = lines
+    .map((line) => line.map((value) => `"${String(value ?? "").replaceAll('"', '""')}"`).join(";"))
+    .join("\n");
+  downloadBlob(new Blob([`\ufeff${csv}`], { type: "text/csv;charset=utf-8" }), `rapport_import_excel_${Date.now()}.csv`);
 }
 
 function downloadTicket(id) {
@@ -2338,9 +2653,11 @@ document.addEventListener("click", (event) => {
   if (action === "download-ticket") downloadTicket(id);
   if (action === "doc-request-details") viewDocumentRequest(id);
   if (action === "generate-doc-request") generateDocumentRequest(id);
-  if (action === "download-doc-request") downloadDocumentRequest(id);
+  if (action === "download-doc-request") downloadDocumentRequest(id, actionTarget.dataset.format || "docx");
   if (action === "transmit-doc-request") transmitDocumentRequest(id);
   if (action === "refuse-doc-request") refuseDocumentRequest(id);
+  if (action === "confirm-excel-import") confirmEmployeeExcelImport();
+  if (action === "download-import-report") downloadExcelPreviewReport();
   if (action === "restore-template") restoreTemplate();
   if (action === "export-data") exportData();
   if (action === "backup-db") backupDatabase();
@@ -2449,6 +2766,11 @@ document.getElementById("roleSelect").addEventListener("change", (event) => {
   if (state.employeePortal.active) {
     event.target.value = "Collaborateur";
     showToast("Rôle bloqué dans l’espace salarié.");
+    return;
+  }
+  if (state.serverRole) {
+    event.target.value = state.serverRole;
+    showToast(`Rôle verrouillé par la session : ${state.serverRole}.`);
     return;
   }
   state.data.currentRole = event.target.value;

@@ -52,10 +52,13 @@ Le projet contient maintenant :
 
 Variables recommandées dans Render :
 
-- `APP_PASSWORD` : mot de passe d’accès ;
+- `APP_PASSWORD` : mot de passe du rôle `Admin RH` ;
+- `ASSISTANT_RH_PASSWORD` : mot de passe du rôle `Assistant RH` ;
+- `DIRECTION_PASSWORD` : mot de passe du rôle `Direction` ;
 - `APP_SESSION_SECRET` : secret long et aléatoire ;
 - `RH_DATABASE_PATH=/tmp/rh_control.sqlite` tant que la base externe n’est pas branchée ;
-- `DATABASE_URL=postgresql://...` dès qu’une base PostgreSQL gratuite externe est disponible.
+- `DATABASE_URL=postgresql://...` dès qu’une base PostgreSQL gratuite externe est disponible ;
+- variables SMTP optionnelles (`SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM`, `NOTIFY_RH_EMAIL`, `NOTIFY_DIRECTION_EMAIL`) pour activer l’envoi e-mail réel.
 
 ## Solution gratuite pour une base durable
 
@@ -64,7 +67,7 @@ Ne pas utiliser Render Postgres gratuit pour les données importantes, car il ex
 Solution recommandée sans paiement :
 
 1. Garder l’application sur Render gratuit.
-2. Créer une base PostgreSQL gratuite externe, par exemple Supabase Free ou Neon Free.
+2. Créer une base PostgreSQL gratuite externe, par exemple Neon Free.
 3. Copier l’URL de connexion PostgreSQL.
 4. Ajouter cette URL dans Render avec le nom `DATABASE_URL`.
 5. Redéployer.

@@ -13,9 +13,11 @@ import unicodedata
 import uuid
 import webbrowser
 from datetime import date, datetime, timedelta
+from email.message import EmailMessage
 from io import BytesIO
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import smtplib
 from typing import Any
 from urllib.parse import urlparse
 
@@ -31,6 +33,22 @@ except ImportError:  # L'import Excel reste optionnel jusqu'au build Render.
     Workbook = None
     load_workbook = None
     from_excel = None
+
+try:
+    from docx import Document
+except ImportError:  # La génération Word reste optionnelle jusqu'au build Render.
+    Document = None
+
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+except ImportError:  # La génération PDF reste optionnelle jusqu'au build Render.
+    A4 = None
+    getSampleStyleSheet = None
+    Paragraph = None
+    SimpleDocTemplate = None
+    Spacer = None
 
 ROOT = Path(__file__).resolve().parent
 LOCAL_DB_DIR = ROOT / "database"
@@ -52,6 +70,31 @@ APP_SESSION_SECRET = os.environ.get("APP_SESSION_SECRET") or APP_PASSWORD or "lo
 SESSION_COOKIE = "rh_session"
 EMPLOYEE_SESSION_COOKIE = "rh_employee"
 SESSION_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+ROLE_PASSWORDS = {
+    "Admin RH": APP_PASSWORD,
+    "Assistant RH": os.environ.get("ASSISTANT_RH_PASSWORD", ""),
+    "Direction": os.environ.get("DIRECTION_PASSWORD", ""),
+}
+ROLE_PERMISSIONS = {
+    "Admin RH": {
+        "state_write", "import_json", "export_json", "backup", "excel_import", "excel_template",
+        "leave_to_direction", "leave_modify", "leave_refuse", "leave_approve", "document_render",
+    },
+    "Assistant RH": {
+        "state_write", "excel_import", "excel_template",
+        "leave_to_direction", "leave_modify", "leave_refuse", "document_render",
+    },
+    "Direction": {
+        "leave_refuse", "leave_approve", "document_render",
+    },
+}
+SMTP_HOST = os.environ.get("SMTP_HOST", "")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+SMTP_FROM = os.environ.get("SMTP_FROM") or SMTP_USER
+NOTIFY_RH_EMAIL = os.environ.get("NOTIFY_RH_EMAIL", "")
+NOTIFY_DIRECTION_EMAIL = os.environ.get("NOTIFY_DIRECTION_EMAIL", "")
 EMPLOYEE_EXCEL_COLUMNS = [
     "Noms et prénoms",
     "Matricule",
@@ -172,6 +215,7 @@ def default_state() -> dict:
         "documentRequests": [],
         "documents": [],
         "documentTemplates": dict(DEFAULT_DOCUMENT_TEMPLATES),
+        "notifications": [],
         "auditLog": [],
     }
 
@@ -200,7 +244,7 @@ def normalize_state(value: Any) -> dict:
         templates.update({str(k): str(v) for k, v in incoming_templates.items()})
     state["documentTemplates"] = templates
 
-    for key in ["employees", "leaveRequests", "documentRequests", "documents", "auditLog"]:
+    for key in ["employees", "leaveRequests", "documentRequests", "documents", "notifications", "auditLog"]:
         items = value.get(key)
         state[key] = items if isinstance(items, list) else []
 
@@ -441,7 +485,7 @@ def employee_from_excel_row(row: dict[str, Any], existing: dict | None = None) -
     return employee
 
 
-def import_employees_from_excel(content: bytes) -> dict:
+def workbook_rows_from_excel(content: bytes) -> tuple[list[str], list[tuple[int, dict[str, Any]]]]:
     if load_workbook is None:
         raise RuntimeError("La lecture Excel n'est pas disponible. Vérifiez la dépendance openpyxl.")
 
@@ -452,6 +496,85 @@ def import_employees_from_excel(content: bytes) -> dict:
         raise RuntimeError("Le fichier Excel ne contient pas d'en-têtes.")
 
     headers = [normalize_lookup(value) for value in header_cells]
+    parsed_rows: list[tuple[int, dict[str, Any]]] = []
+    for row_number, excel_row in enumerate(sheet.iter_rows(min_row=2, values_only=True), start=2):
+        if not any(cell not in (None, "") for cell in excel_row):
+            continue
+        row = {headers[index]: excel_row[index] for index in range(min(len(headers), len(excel_row)))}
+        parsed_rows.append((row_number, row))
+    return headers, parsed_rows
+
+
+def preview_employees_from_excel(content: bytes) -> dict:
+    headers, parsed_rows = workbook_rows_from_excel(content)
+    data = get_state()
+    existing_by_matricule = {
+        normalize_lookup(employee.get("matricule")): employee
+        for employee in data.get("employees", [])
+    }
+    missing_columns = [
+        column for column in EMPLOYEE_EXCEL_COLUMNS
+        if normalize_lookup(column) not in headers
+    ]
+    results = []
+    created = 0
+    updated = 0
+    skipped = 0
+    errors_count = 0
+
+    for row_number, row in parsed_rows:
+        matricule = str(row_get(row, "Matricule", "Matricule Zeus")).strip()
+        full_name = str(row_get(row, "Noms et prénoms", "Nom et prénoms", "Nom complet", "Collaborateur")).strip()
+        first_name = str(row_get(row, "Prénom", "Prénoms", "Prenom", "Prenoms")).strip()
+        last_name = str(row_get(row, "Nom", "Noms")).strip()
+        row_errors = []
+        row_warnings = []
+        if not matricule:
+            row_errors.append("Matricule Zeus manquant")
+            skipped += 1
+        if not (full_name or first_name or last_name):
+            row_errors.append("Nom et prénoms manquants")
+        contract_end = parse_excel_date(row_get(row, "Date de fin de contrat en cours", "Date fin contrat", "Fin contrat"))
+        contract_start = parse_excel_date(row_get(row, "Date de début de contrat en cours", "Date debut contrat", "Début contrat"))
+        if contract_start and contract_end and contract_end < contract_start:
+            row_warnings.append("La date de fin de contrat est avant la date de début")
+        key = normalize_lookup(matricule)
+        existing = existing_by_matricule.get(key)
+        action = "Erreur" if row_errors else ("Mise à jour" if existing else "Création")
+        if row_errors:
+            errors_count += 1
+            skipped += 1 if matricule else 0
+        elif existing:
+            updated += 1
+        else:
+            created += 1
+        results.append({
+            "row": row_number,
+            "matricule": matricule,
+            "name": full_name or f"{first_name} {last_name}".strip(),
+            "department": str(row_get(row, "Département", "Departement", "Service")).strip(),
+            "function": str(row_get(row, "Fonctions", "Fonction", "Poste")).strip(),
+            "action": action,
+            "errors": row_errors,
+            "warnings": row_warnings,
+        })
+
+    return {
+        "created": created,
+        "updated": updated,
+        "skipped": skipped,
+        "errors": errors_count,
+        "rows": results,
+        "missingColumns": missing_columns,
+    }
+
+
+def import_employees_from_excel(content: bytes, actor: str = "Admin RH") -> dict:
+    preview = preview_employees_from_excel(content)
+    if preview.get("errors"):
+        raise RuntimeError("Le fichier contient des lignes en erreur. Corrige-les ou retire-les avant l'import.")
+
+    _, parsed_rows = workbook_rows_from_excel(content)
     data = get_state()
     existing_by_matricule = {
         normalize_lookup(employee.get("matricule")): employee
@@ -462,12 +585,15 @@ def import_employees_from_excel(content: bytes) -> dict:
     updated = 0
     skipped = 0
 
-    for excel_row in sheet.iter_rows(min_row=2, values_only=True):
-        if not any(cell not in (None, "") for cell in excel_row):
-            continue
-        row = {headers[index]: excel_row[index] for index in range(min(len(headers), len(excel_row)))}
+    for _, row in parsed_rows:
         matricule = str(row_get(row, "Matricule", "Matricule Zeus")).strip()
         if not matricule:
+            skipped += 1
+            continue
+        full_name = str(row_get(row, "Noms et prénoms", "Nom et prénoms", "Nom complet", "Collaborateur")).strip()
+        first_name = str(row_get(row, "Prénom", "Prénoms", "Prenom", "Prenoms")).strip()
+        last_name = str(row_get(row, "Nom", "Noms")).strip()
+        if not (full_name or first_name or last_name):
             skipped += 1
             continue
         key = normalize_lookup(matricule)
@@ -487,11 +613,11 @@ def import_employees_from_excel(content: bytes) -> dict:
 
     data.setdefault("auditLog", []).insert(0, {
         "date": datetime.now().date().isoformat(),
-        "actor": "Admin RH",
+        "actor": actor,
         "action": f"Import Excel collaborateurs : {created} créé(s), {updated} mis à jour, {skipped} ignoré(s).",
     })
     save_state(data)
-    return {"created": created, "updated": updated, "skipped": skipped, "data": get_state()}
+    return {"created": created, "updated": updated, "skipped": skipped, "preview": preview, "data": get_state()}
 
 
 def build_employee_template_workbook() -> bytes:
@@ -582,18 +708,262 @@ def employee_portal_payload(data: dict, employee: dict) -> dict:
     }
 
 
+def full_name_server(employee: dict) -> str:
+    return " ".join(
+        part for part in [employee.get("firstName", ""), employee.get("lastName", "")]
+        if str(part).strip()
+    ).strip() or employee.get("matricule", "Collaborateur")
+
+
+def format_date_fr(value: str) -> str:
+    if not value:
+        return "—"
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").strftime("%d/%m/%Y")
+    except ValueError:
+        return value
+
+
+def today_iso() -> str:
+    return datetime.now().date().isoformat()
+
+
+def make_leave_ticket_server(leave: dict, employee: dict) -> str:
+    observations = leave.get("observations") or []
+    return f"""TICKET DE CONGÉ
+
+Collaborateur : {full_name_server(employee)}
+Matricule : {employee.get('matricule', '')}
+Fonction : {employee.get('fonction', '')}
+Service : {employee.get('service', '')}
+
+Type de congé : {leave.get('type', '')}
+Date de départ : {format_date_fr(leave.get('start', ''))}
+Date de fin : {format_date_fr(leave.get('end', ''))}
+Date de reprise : {format_date_fr(leave.get('returnDate', ''))}
+Nombre de jours : {leave.get('days', 0)}
+
+Statut : {leave.get('status', '')}
+Généré le : {format_date_fr(today_iso())}
+
+Observation RH / Direction :
+{chr(10).join(observations) if observations else 'Aucune observation.'}"""
+
+
+def record_notification(data: dict, event_type: str, subject: str, body: str, recipients: list[str] | None = None) -> dict:
+    recipients = [email for email in (recipients or []) if email]
+    item = {
+        "id": f"notif-{uuid.uuid4().hex[:12]}",
+        "date": datetime.now().isoformat(timespec="seconds"),
+        "type": event_type,
+        "subject": subject,
+        "body": body,
+        "recipients": recipients,
+        "status": "Journalisé",
+        "error": "",
+    }
+    if SMTP_HOST and SMTP_FROM and recipients:
+        try:
+            message = EmailMessage()
+            message["Subject"] = subject
+            message["From"] = SMTP_FROM
+            message["To"] = ", ".join(recipients)
+            message.set_content(body)
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=12) as smtp:
+                smtp.starttls()
+                if SMTP_USER and SMTP_PASSWORD:
+                    smtp.login(SMTP_USER, SMTP_PASSWORD)
+                smtp.send_message(message)
+            item["status"] = "E-mail envoyé"
+            item["sentAt"] = datetime.now().isoformat(timespec="seconds")
+        except Exception as exc:
+            item["status"] = "Échec e-mail"
+            item["error"] = str(exc)
+    data.setdefault("notifications", []).insert(0, item)
+    return item
+
+
+def notify_employee_if_possible(data: dict, employee: dict, subject: str, body: str, event_type: str) -> None:
+    record_notification(data, event_type, subject, body, [employee.get("email", "")])
+
+
+def transition_leave_server(data: dict, leave_id: str, action: str, role: str, observation: str = "") -> dict:
+    permission = f"leave_{action.replace('-', '_')}"
+    if not role_has_permission(role, permission):
+        raise PermissionError("Action non autorisée pour ce rôle.")
+
+    leave = next((item for item in data.get("leaveRequests", []) if item.get("id") == leave_id), None)
+    if not leave:
+        raise RuntimeError("Demande de congé introuvable.")
+    employee = find_employee_by_id(data, leave.get("employeeId", ""))
+    if not employee:
+        raise RuntimeError("Collaborateur introuvable.")
+
+    leave.setdefault("observations", [])
+    leave.setdefault("history", [])
+    actor = normalize_role(role)
+    stamp = format_date_fr(today_iso())
+    name = full_name_server(employee)
+    observation = observation.strip()
+
+    if action == "to-direction":
+        leave["status"] = "En attente de validation Direction"
+        leave["observations"].append(f"{actor} : {observation or 'demande vérifiée et transmise à la Direction.'}")
+        leave["history"].append(f"{stamp} : demande transmise à la Direction.")
+        data.setdefault("auditLog", []).insert(0, {"date": today_iso(), "actor": actor, "action": f"Demande de {name} transmise à la Direction."})
+        record_notification(
+            data,
+            "Congés",
+            "Demande de congé à valider",
+            f"{name} attend une validation Direction pour {leave.get('days', 0)} jour(s), du {format_date_fr(leave.get('start', ''))} au {format_date_fr(leave.get('end', ''))}.",
+            [NOTIFY_DIRECTION_EMAIL],
+        )
+    elif action == "modify":
+        leave["status"] = "Modification demandée"
+        leave["observations"].append(f"{actor} : {observation or 'modification demandée.'}")
+        leave["history"].append(f"{stamp} : modification demandée.")
+        data.setdefault("auditLog", []).insert(0, {"date": today_iso(), "actor": actor, "action": f"Modification demandée pour le congé de {name}."})
+        notify_employee_if_possible(data, employee, "Modification demandée sur votre congé", f"Observation : {observation or 'modification demandée.'}", "Congés")
+    elif action == "refuse":
+        leave["status"] = "Refusé"
+        leave["observations"].append(f"{actor} : {observation or 'demande refusée.'}")
+        leave["history"].append(f"{stamp} : demande refusée.")
+        data.setdefault("auditLog", []).insert(0, {"date": today_iso(), "actor": actor, "action": f"Demande de congé refusée pour {name}."})
+        notify_employee_if_possible(data, employee, "Demande de congé refusée", f"Observation : {observation or 'demande refusée.'}", "Congés")
+    elif action == "approve":
+        was_validated = leave.get("status") == "Validé"
+        leave["status"] = "Validé"
+        leave["observations"].append(f"{actor} : {observation or 'demande validée.'}")
+        leave["history"].append(f"{stamp} : demande validée par la Direction.")
+        if not was_validated:
+            balance = employee.setdefault("leaveBalance", {})
+            balance["taken"] = float(balance.get("taken", 0) or 0) + float(leave.get("days", 0) or 0)
+            balance["available"] = float(balance.get("available", 0) or 0) - float(leave.get("days", 0) or 0)
+        if data.get("settings", {}).get("ticketEnabled", True) and not any(doc.get("leaveId") == leave_id for doc in data.get("documents", [])):
+            content = make_leave_ticket_server(leave, employee)
+            data.setdefault("documents", []).append({
+                "id": f"doc-{uuid.uuid4().hex[:12]}",
+                "employeeId": employee.get("id", ""),
+                "leaveId": leave.get("id", ""),
+                "title": f"Ticket de congé - {name}",
+                "status": "Document à transmettre",
+                "createdAt": today_iso(),
+                "content": content,
+            })
+            leave["history"].append(f"{stamp} : ticket de congé généré.")
+        data.setdefault("auditLog", []).insert(0, {"date": today_iso(), "actor": actor, "action": f"Demande de congé validée pour {name}."})
+        notify_employee_if_possible(data, employee, "Demande de congé validée", f"Votre congé du {format_date_fr(leave.get('start', ''))} au {format_date_fr(leave.get('end', ''))} est validé.", "Congés")
+    else:
+        raise RuntimeError("Action congé inconnue.")
+    return data
+
+
+def safe_filename(value: str, suffix: str) -> str:
+    text = normalize_lookup(value) or "document_rh"
+    return f"{text}.{suffix}"
+
+
+def xml_escape(text: str) -> str:
+    return (
+        str(text)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def render_document_file(title: str, content: str, file_format: str) -> tuple[bytes, str, str]:
+    title = str(title or "Document RH").strip() or "Document RH"
+    content = str(content or "").strip()
+    file_format = str(file_format or "docx").lower()
+    if file_format == "docx":
+        if Document is None:
+            raise RuntimeError("La génération Word n'est pas disponible. Vérifiez la dépendance python-docx.")
+        document = Document()
+        document.add_heading(title, level=1)
+        for block in content.split("\n\n"):
+            lines = [line for line in block.splitlines()]
+            if not lines:
+                document.add_paragraph("")
+            else:
+                paragraph = document.add_paragraph()
+                for index, line in enumerate(lines):
+                    if index:
+                        paragraph.add_run().add_break()
+                    paragraph.add_run(line)
+        buffer = BytesIO()
+        document.save(buffer)
+        return (
+            buffer.getvalue(),
+            safe_filename(title, "docx"),
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+    if file_format == "pdf":
+        if SimpleDocTemplate is None or getSampleStyleSheet is None or Paragraph is None or Spacer is None:
+            raise RuntimeError("La génération PDF n'est pas disponible. Vérifiez la dépendance reportlab.")
+        buffer = BytesIO()
+        pdf = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=48, leftMargin=48, topMargin=54, bottomMargin=48)
+        styles = getSampleStyleSheet()
+        story = [Paragraph(xml_escape(title), styles["Title"]), Spacer(1, 18)]
+        for block in content.split("\n\n"):
+            html = "<br/>".join(xml_escape(line) for line in block.splitlines()) or "&nbsp;"
+            story.append(Paragraph(html, styles["BodyText"]))
+            story.append(Spacer(1, 9))
+        pdf.build(story)
+        return buffer.getvalue(), safe_filename(title, "pdf"), "application/pdf"
+    raise RuntimeError("Format non reconnu. Utilise docx ou pdf.")
+
+
+def sanitize_state_for_role(incoming: dict, role: str) -> dict:
+    state = normalize_state(incoming)
+    if normalize_role(role) == "Admin RH":
+        return state
+    current = get_state()
+    state["settings"] = current.get("settings", dict(DEFAULT_SETTINGS))
+    state["documentTemplates"] = current.get("documentTemplates", dict(DEFAULT_DOCUMENT_TEMPLATES))
+    state["currentRole"] = current.get("currentRole", "Admin RH")
+    return state
+
+
+def configured_role_passwords() -> dict[str, str]:
+    return {role: password for role, password in ROLE_PASSWORDS.items() if password}
+
+
 def auth_required() -> bool:
-    return bool(APP_PASSWORD)
+    return bool(configured_role_passwords())
+
+
+def normalize_role(role: str | None) -> str:
+    role = str(role or "Admin RH").strip()
+    return role if role in ROLE_PERMISSIONS else "Admin RH"
+
+
+def authenticate_role(role: str, password: str) -> bool:
+    passwords = configured_role_passwords()
+    if not passwords:
+        return True
+    role = normalize_role(role)
+    expected = passwords.get(role)
+    if not expected:
+        return False
+    return hmac.compare_digest(password, expected)
+
+
+def role_has_permission(role: str | None, permission: str) -> bool:
+    role = normalize_role(role)
+    return permission in ROLE_PERMISSIONS.get(role, set())
 
 
 def sign_session(payload: str) -> str:
     return hmac.new(APP_SESSION_SECRET.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def create_session_cookie() -> str:
+def create_session_cookie(role: str = "Admin RH") -> str:
+    role = normalize_role(role)
     issued_at = str(int(time.time()))
-    signature = sign_session(issued_at)
-    token = base64.urlsafe_b64encode(f"{issued_at}:{signature}".encode("utf-8")).decode("ascii")
+    payload = f"admin:{role}:{issued_at}"
+    signature = sign_session(payload)
+    token = base64.urlsafe_b64encode(f"{role}:{issued_at}:{signature}".encode("utf-8")).decode("ascii")
     flags = "HttpOnly; Path=/; SameSite=Lax; Max-Age=" + str(SESSION_MAX_AGE_SECONDS)
     if os.environ.get("RENDER"):
         flags += "; Secure"
@@ -627,22 +997,37 @@ def parse_cookie(header: str | None) -> dict[str, str]:
     return cookies
 
 
-def verify_session_cookie(header: str | None) -> bool:
+def admin_role_from_cookie(header: str | None) -> str | None:
     if not auth_required():
-        return True
+        return "Admin RH"
     token = parse_cookie(header).get(SESSION_COOKIE)
     if not token:
-        return False
+        return None
     try:
         decoded = base64.urlsafe_b64decode(token.encode("ascii")).decode("utf-8")
-        issued_at, signature = decoded.split(":", 1)
-        if not hmac.compare_digest(signature, sign_session(issued_at)):
-            return False
+        parts = decoded.split(":")
+        if len(parts) == 2:
+            issued_at, signature = parts
+            if not hmac.compare_digest(signature, sign_session(issued_at)):
+                return None
+            role = "Admin RH"
+        elif len(parts) == 3:
+            role, issued_at, signature = parts
+            role = normalize_role(role)
+            payload = f"admin:{role}:{issued_at}"
+            if not hmac.compare_digest(signature, sign_session(payload)):
+                return None
+        else:
+            return None
         if time.time() - int(issued_at) > SESSION_MAX_AGE_SECONDS:
-            return False
-        return True
+            return None
+        return role
     except Exception:
-        return False
+        return None
+
+
+def verify_session_cookie(header: str | None) -> bool:
+    return bool(admin_role_from_cookie(header))
 
 
 def verify_employee_session_cookie(header: str | None) -> str | None:
@@ -844,6 +1229,7 @@ def get_state() -> dict:
             "documentRequests": [],
             "documents": documents,
             "documentTemplates": dict(DEFAULT_DOCUMENT_TEMPLATES),
+            "notifications": [],
             "auditLog": audit_log,
         }
 
@@ -1070,6 +1456,19 @@ class Handler(SimpleHTTPRequestHandler):
     def employee_id_from_cookie(self) -> str | None:
         return verify_employee_session_cookie(self.headers.get("Cookie"))
 
+    def current_admin_role(self) -> str | None:
+        return admin_role_from_cookie(self.headers.get("Cookie"))
+
+    def require_permission(self, permission: str) -> str | None:
+        role = self.current_admin_role()
+        if not role:
+            self.send_json({"ok": False, "error": "Authentification requise"}, status=401)
+            return None
+        if not role_has_permission(role, permission):
+            self.send_json({"ok": False, "error": "Action non autorisée pour ce rôle"}, status=403)
+            return None
+        return role
+
     def require_employee(self) -> tuple[dict, dict] | None:
         employee_id = self.employee_id_from_cookie()
         if not employee_id:
@@ -1091,13 +1490,16 @@ class Handler(SimpleHTTPRequestHandler):
                 "mode": DB_MODE,
                 "durable": db_is_durable(),
                 "authRequired": auth_required(),
+                "emailConfigured": bool(SMTP_HOST and SMTP_FROM),
             })
             return
         if path == "/api/auth/status":
+            role = self.current_admin_role()
             self.send_json({
                 "ok": True,
                 "authRequired": auth_required(),
-                "authenticated": self.is_authenticated(),
+                "authenticated": bool(role),
+                "role": role,
             })
             return
         if path == "/api/employee/status":
@@ -1117,17 +1519,19 @@ class Handler(SimpleHTTPRequestHandler):
                 "ok": True,
                 "database": database_label(),
                 "durable": db_is_durable(),
+                "role": self.current_admin_role(),
+                "emailConfigured": bool(SMTP_HOST and SMTP_FROM),
                 "data": get_state(),
             })
             return
         if path == "/api/export":
-            if not self.require_auth():
+            if not self.require_permission("export_json"):
                 return
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             self.send_json_download(f"rh_control_export_{stamp}.json", get_state())
             return
         if path == "/api/employees/template":
-            if not self.require_auth():
+            if not self.require_permission("excel_template"):
                 return
             try:
                 body = build_employee_template_workbook()
@@ -1153,10 +1557,11 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/auth/login":
             payload = self.read_json()
             password = payload.get("password", "")
-            if not auth_required() or hmac.compare_digest(password, APP_PASSWORD):
+            role = normalize_role(payload.get("role", "Admin RH"))
+            if authenticate_role(role, password):
                 self.send_json(
-                    {"ok": True, "authRequired": auth_required()},
-                    extra_headers={"Set-Cookie": create_session_cookie()},
+                    {"ok": True, "authRequired": auth_required(), "role": role},
+                    extra_headers={"Set-Cookie": create_session_cookie(role)},
                 )
                 return
             self.send_json({"ok": False, "error": "Mot de passe incorrect"}, status=401)
@@ -1224,6 +1629,13 @@ class Handler(SimpleHTTPRequestHandler):
                 "actor": "Collaborateur",
                 "action": f"{employee.get('firstName', '')} {employee.get('lastName', '')} a envoyé une demande de congé.",
             })
+            record_notification(
+                data,
+                "Congés",
+                "Nouvelle demande de congé",
+                f"{full_name_server(employee)} a demandé {days} jour(s), du {format_date_fr(start)} au {format_date_fr(end)}.",
+                [NOTIFY_RH_EMAIL],
+            )
             save_state(data)
             refreshed = get_state()
             refreshed_employee = find_employee_by_id(refreshed, employee["id"]) or employee
@@ -1253,25 +1665,81 @@ class Handler(SimpleHTTPRequestHandler):
                 "actor": "Collaborateur",
                 "action": f"Demande de document '{request_type}' envoyée par {employee.get('matricule', '')}.",
             })
+            record_notification(
+                data,
+                "Documents",
+                "Nouvelle demande de document RH",
+                f"{full_name_server(employee)} a demandé : {request_type}. Précision : {details or '—'}.",
+                [NOTIFY_RH_EMAIL],
+            )
             save_state(data)
             refreshed = get_state()
             refreshed_employee = find_employee_by_id(refreshed, employee["id"]) or employee
             self.send_json({"ok": True, "data": employee_portal_payload(refreshed, refreshed_employee)})
             return
-        if path == "/api/employees/import-excel":
-            if not self.require_auth():
+        if path == "/api/admin/leave-transition":
+            role = self.current_admin_role()
+            if not role:
+                self.send_json({"ok": False, "error": "Authentification requise"}, status=401)
+                return
+            try:
+                payload = self.read_json()
+                data = get_state()
+                transition_leave_server(
+                    data,
+                    str(payload.get("id", "")).strip(),
+                    str(payload.get("action", "")).strip(),
+                    role,
+                    str(payload.get("observation", "")).strip(),
+                )
+                save_state(data)
+                self.send_json({"ok": True, "data": get_state()})
+            except PermissionError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=403)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=400)
+            return
+        if path == "/api/documents/render":
+            if not self.require_permission("document_render"):
+                return
+            try:
+                payload = self.read_json()
+                body, filename, content_type = render_document_file(
+                    str(payload.get("title", "Document RH")),
+                    str(payload.get("content", "")),
+                    str(payload.get("format", "docx")),
+                )
+                self.send_binary_download(filename, body, content_type)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=500)
+            return
+        if path == "/api/employees/preview-excel":
+            if not self.require_permission("excel_import"):
                 return
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 body = self.rfile.read(length)
                 content = extract_multipart_file(body, self.headers.get("Content-Type", ""))
-                result = import_employees_from_excel(content)
+                result = preview_employees_from_excel(content)
+                self.send_json({"ok": True, **result})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=500)
+            return
+        if path == "/api/employees/import-excel":
+            role = self.require_permission("excel_import")
+            if not role:
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length)
+                content = extract_multipart_file(body, self.headers.get("Content-Type", ""))
+                result = import_employees_from_excel(content, actor=role)
                 self.send_json({"ok": True, **result})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=500)
             return
         if path == "/api/backup":
-            if not self.require_auth():
+            if not self.require_permission("backup"):
                 return
             try:
                 backup_path, backup_type = create_database_backup()
@@ -1284,17 +1752,18 @@ class Handler(SimpleHTTPRequestHandler):
     def do_PUT(self):
         path = urlparse(self.path).path
         if path == "/api/state":
-            if not self.require_auth():
+            role = self.require_permission("state_write")
+            if not role:
                 return
             try:
                 payload = self.read_json()
-                save_state(payload.get("data", payload))
+                save_state(sanitize_state_for_role(payload.get("data", payload), role))
                 self.send_json({"ok": True, "database": database_label()})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, status=500)
             return
         if path == "/api/import":
-            if not self.require_auth():
+            if not self.require_permission("import_json"):
                 return
             try:
                 payload = self.read_json()

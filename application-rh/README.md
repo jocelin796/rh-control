@@ -68,14 +68,18 @@ Créer un `Web Service` avec ces paramètres :
 
 Important : sans `DATABASE_URL`, la base SQLite Render reste temporaire et peut être perdue après redémarrage ou redéploiement.
 
-## Sécurité légère
+## Sécurité et rôles
 
 Le serveur peut protéger l’application par mot de passe avec ces variables Render :
 
-- `APP_PASSWORD` : mot de passe d’accès à l’application ;
+- `APP_PASSWORD` : mot de passe du rôle `Admin RH` ;
+- `ASSISTANT_RH_PASSWORD` : mot de passe du rôle `Assistant RH` ;
+- `DIRECTION_PASSWORD` : mot de passe du rôle `Direction` ;
 - `APP_SESSION_SECRET` : secret utilisé pour signer la session.
 
-Si `APP_PASSWORD` n’est pas défini, l’application reste ouverte.
+Chaque session reçoit un rôle côté serveur. Le rôle `Direction` ne peut pas modifier toute la base : il peut seulement valider ou refuser les demandes prévues pour lui. Le rôle `Assistant RH` peut gérer l’opérationnel, mais les réglages sensibles et les modèles restent réservés à l’Admin RH.
+
+Si aucun mot de passe n’est défini, l’application reste ouverte.
 
 ## Sauvegardes
 
@@ -105,11 +109,14 @@ Il est toujours possible d’ouvrir `index.html` directement, mais dans ce mode 
 ## Fonctions incluses
 
 - Tableau de bord RH avec indicateurs clés.
+- Tableau de bord décisionnel : groupes à risque, groupes stables, attentes RH et Direction.
 - Fiches collaborateurs avec contrat et solde de congés.
-- Import Excel des collaborateurs par matricule Zeus.
+- Import Excel des collaborateurs par matricule Zeus avec aperçu, erreurs et rapport CSV avant validation.
 - Portail salarié : connexion par matricule, demande de congé et suivi.
 - Demande de documents RH : attestation de travail, domiciliation de salaire, bulletin, fiche de congé, attestation de départ en congé annuel, certificat de travail et autres demandes.
 - Modèles de documents paramétrables avec remplissage automatique.
+- Téléchargement des documents générés en Word `.docx` ou PDF `.pdf`.
+- Journal interne des notifications et préparation SMTP pour envoi e-mail réel.
 - Suivi des contrats avec alertes d’échéance.
 - Renouvellement de contrat avec conservation de l’historique.
 - Formulaire de demande de congé.
@@ -128,6 +135,16 @@ Il est toujours possible d’ouvrir `index.html` directement, mais dans ce mode 
 ## Import Excel des collaborateurs
 
 Dans `Collaborateurs`, cliquer sur `Télécharger modèle Excel`, remplir le fichier, puis cliquer sur `Importer Excel`.
+
+L’application affiche d’abord un aperçu :
+
+- lignes à créer ;
+- lignes à mettre à jour ;
+- erreurs à corriger ;
+- avertissements ;
+- rapport CSV téléchargeable.
+
+L’import réel ne se lance qu’après confirmation.
 
 Le matricule Zeus est la clé :
 
