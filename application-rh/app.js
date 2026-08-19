@@ -248,6 +248,10 @@ async function apiFetch(url, options = {}) {
   return response;
 }
 
+function setLoginMode(active) {
+  document.body.classList.toggle("login-mode", Boolean(active));
+}
+
 async function initApp() {
   if (!API_MODE) {
     render();
@@ -309,72 +313,93 @@ async function initApp() {
 }
 
 function renderLogin() {
+  setLoginMode(true);
   document.getElementById("pageTitle").textContent = "Connexion RH";
   document.getElementById("appContent").innerHTML = `
-    <div class="login-choice-grid">
-      <section class="panel">
-        <div class="panel-header">
+    <section class="login-page">
+      <div class="login-hero">
+        <div class="login-brand">
+          <div class="login-mark">P</div>
           <div>
-            <h3>🔐 Administration RH</h3>
-            <p>Accès complet : import Excel, contrats, validations, documents et paramétrage.</p>
+            <strong>RH CONTROL</strong>
+            <span>PALLADIUM AFRIQUE</span>
           </div>
         </div>
-        <form id="loginForm" class="form-grid">
-          <label class="full">
-            <span>Rôle</span>
-            <select id="loginRole">
-              <option>Admin RH</option>
-              <option>Assistant RH</option>
-              <option>Direction</option>
-            </select>
-          </label>
-          <label class="full">
-            <span>Mot de passe du rôle</span>
-            <input id="loginPassword" type="password" autocomplete="current-password" required autofocus>
-          </label>
-          <div class="toolbar full">
-            <button class="primary" type="submit">Ouvrir l’administration</button>
-          </div>
-        </form>
-      </section>
-      <section class="panel">
-        <div class="panel-header">
-          <div>
-            <h3>👤 Espace salarié</h3>
-            <p>Connexion simple par matricule Zeus pour demander congés/documents et suivre l’avancement.</p>
-          </div>
+        <div class="hero-art" aria-hidden="true">
+          <div class="africa-map">AF</div>
+          <div class="target-ring"></div>
+          <div class="floating-card card-one"><span></span><span></span><span></span></div>
+          <div class="floating-card card-two"><strong>BI</strong><small>Alertes</small></div>
+          <div class="login-person"></div>
         </div>
-        <form id="employeeLoginForm" class="form-grid">
-          <label class="full">
-            <span>Matricule Zeus</span>
-            <input id="employeeLoginMatricule" placeholder="Exemple : ZEUS001" autocomplete="username" required>
-          </label>
-          <div class="toolbar full">
-            <button class="secondary" type="submit">Entrer dans mon espace</button>
+        <div class="hero-copy">
+          <div class="hero-line"></div>
+          <p class="hero-kicker">PMS GMC GROUP</p>
+          <h1>GESTION RH, CONTRATS ET CONGÉS</h1>
+          <p>Les données collaborateurs alimentent automatiquement les alertes, les validations, les documents RH et les priorités de décision.</p>
+          <div class="hero-stats">
+            <div><strong>Neon</strong><span>base durable</span></div>
+            <div><strong>Excel</strong><span>import sécurisé</span></div>
+            <div><strong>PDF</strong><span>documents RH</span></div>
           </div>
-        </form>
-      </section>
-    </div>
-    <section class="panel">
-      <div class="panel-header">
-        <div>
-          <h3>Maintenance base de données</h3>
-          <p>Export, import et sauvegarde manuelle des données RH.</p>
+          <div class="hero-steps">
+            <div><strong>1</strong><span>Collecte</span><small>Fiches collaborateurs</small></div>
+            <div><strong>2</strong><span>Valide</span><small>RH et Direction</small></div>
+            <div><strong>3</strong><span>Pilote</span><small>Alertes et décisions</small></div>
+          </div>
         </div>
       </div>
-      <div class="${state.durableDatabase ? "success" : "warning"} status-banner">
-        <span>${state.durableDatabase
-          ? `✅ Base durable active : ${state.databasePath || "emplacement serveur"}`
-          : `⚠ Base non durable : ${state.databasePath || "emplacement temporaire"}. Branche une base PostgreSQL externe pour conserver les données.`}</span>
-      </div>
-      <div class="toolbar">
-        <button class="secondary" data-action="export-data">Exporter les données JSON</button>
-        <button class="ghost" data-action="backup-db">Créer une sauvegarde serveur</button>
-        <label class="ghost">
-          Importer JSON
-          <input id="importDataFile" type="file" accept="application/json,.json" hidden>
-        </label>
-        ${state.authRequired ? `<button class="danger" data-action="logout">Déconnexion</button>` : ""}
+
+      <div class="login-side">
+        <div class="login-card">
+          <div class="login-card-accent"></div>
+          <div class="login-card-title">
+            <div class="login-card-mark">P</div>
+            <div>
+              <h2>RAPPORT RH</h2>
+              <p>Espace sécurisé — collaborateurs GMC</p>
+            </div>
+          </div>
+          <form id="loginForm" class="secure-login-form">
+            <label>
+              <span>IDENTIFIANT</span>
+              <select id="loginRole" autocomplete="username">
+                <option>Admin RH</option>
+                <option>Assistant RH</option>
+                <option>Direction</option>
+              </select>
+            </label>
+            <label>
+              <span>MOT DE PASSE</span>
+              <div class="password-wrap">
+                <input id="loginPassword" type="password" autocomplete="current-password" placeholder="Mot de passe" required autofocus>
+                <button type="button" data-action="toggle-login-password">Voir</button>
+              </div>
+            </label>
+            <button class="login-submit" type="submit">SE CONNECTER</button>
+            <button class="forgot-link" type="button" data-action="forgot-password">Mot de passe oublié ?</button>
+          </form>
+
+          <div class="employee-login-strip">
+            <div>
+              <strong>Espace salarié</strong>
+              <span>Connexion avec le matricule Zeus</span>
+            </div>
+            <form id="employeeLoginForm">
+              <input id="employeeLoginMatricule" placeholder="Matricule Zeus" autocomplete="username" required>
+              <button type="submit">Entrer</button>
+            </form>
+          </div>
+        </div>
+
+        <div class="included-title"><span></span><strong>FONCTIONNALITÉS INCLUSES</strong><span></span></div>
+        <div class="feature-stack">
+          <div class="feature-pill"><b>KPI</b><span>Suivi RH, contrats, congés et documents</span></div>
+          <div class="feature-pill"><b>BI</b><span>Tableaux de bord et tendances RH</span></div>
+          <div class="feature-pill"><b>EX</b><span>Import Excel contrôlé avant validation</span></div>
+          <div class="feature-pill"><b>MG</b><span>Rôles Admin, Assistant RH et Direction</span></div>
+        </div>
+        <p class="login-footnote">Accès strictement réservé aux collaborateurs autorisés du Groupe GMC.</p>
       </div>
     </section>
   `;
@@ -770,6 +795,7 @@ function setView(view) {
 }
 
 function render() {
+  setLoginMode(false);
   enforceAllowedView();
   const content = document.getElementById("appContent");
   const renderers = {
@@ -2246,6 +2272,7 @@ async function employeeLogout() {
 }
 
 function renderEmployeePortal() {
+  setLoginMode(false);
   const portal = state.employeePortal.data;
   if (!portal?.employee) {
     renderLogin();
@@ -2629,6 +2656,15 @@ document.addEventListener("click", (event) => {
   }
 
   if (action === "close-modal") closeModal();
+  if (action === "toggle-login-password") {
+    const input = document.getElementById("loginPassword");
+    if (input) {
+      const visible = input.type === "text";
+      input.type = visible ? "password" : "text";
+      actionTarget.textContent = visible ? "Voir" : "Cacher";
+    }
+  }
+  if (action === "forgot-password") showToast("Contacte l’Admin RH pour réinitialiser ton accès.");
   if (action === "employee-file") employeeFile(id);
   if (action === "new-leave-for") {
     setView("leaves");
